@@ -12,9 +12,11 @@ pub struct Message {
 
     pub content: String,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
 
     #[cfg(feature = "image")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<Arc<PhotonImage>>,
 }
 
@@ -132,25 +134,25 @@ impl From<Message> for AgentValue {
 #[derive(Clone, Default, Debug)]
 pub struct MessageHistory {
     messages: Vec<Message>,
-    max_size: i64,
+    max_size: usize,
     system_message: Option<Message>,
     include_system: bool,
+    preamble: Vec<Message>,
 }
 
 impl MessageHistory {
-    pub fn new(messages: Vec<Message>, max_size: i64) -> Self {
+    pub fn new(messages: Vec<Message>, max_size: usize) -> Self {
         let mut messages = messages;
         let mut system_message = None;
         if max_size > 0 {
-            if messages.len() > max_size as usize {
+            if messages.len() > max_size {
                 // find system message if it will be excluded from history
-                for i in 0..(max_size - 1) as usize {
+                for i in 0..(messages.len() - max_size) {
                     if messages[i].role == "system" {
                         system_message = Some(messages[i].clone());
-                        break;
                     }
                 }
-                messages = messages[messages.len() - max_size as usize..].to_vec();
+                messages = messages[messages.len() - max_size..].to_vec();
             }
         }
         Self {
@@ -158,6 +160,7 @@ impl MessageHistory {
             max_size,
             system_message,
             include_system: false,
+            preamble: Vec::new(),
         }
     }
 
@@ -186,45 +189,6 @@ impl MessageHistory {
         Self::from_json(value)
     }
 
-    pub fn include_system(&mut self, include: bool) {
-        self.include_system = include;
-    }
-
-    pub fn push(&mut self, message: Message) {
-        // If the message is the same as the last one, update it instead of adding a new one
-        if !self.messages.is_empty() {
-            let last_index = self.messages.len() - 1;
-            let last_message = &mut self.messages[last_index];
-            if last_message.id == message.id {
-                last_message.content = message.content;
-                return;
-            }
-        }
-
-        if self.max_size > 0 && self.messages.len() >= self.max_size as usize {
-            self.messages.remove(0);
-        }
-        self.messages.push(message);
-    }
-
-    pub fn reset(&mut self) {
-        self.messages.clear();
-    }
-
-    pub fn set_size(&mut self, size: i64) {
-        self.max_size = size;
-        if self.max_size > 0 && self.messages.len() > self.max_size as usize {
-            // find system message if it will be excluded from history
-            for i in 0..(self.max_size - 1) as usize {
-                if self.messages[i].role == "system" {
-                    self.system_message = Some(self.messages[i].clone());
-                    break;
-                }
-            }
-            self.messages = self.messages[self.messages.len() - self.max_size as usize..].to_vec();
-        }
-    }
-
     pub fn messages(&self) -> Vec<Message> {
         if self.include_system {
             let mut msgs = Vec::new();
@@ -237,6 +201,55 @@ impl MessageHistory {
             self.messages.clone()
         }
     }
+
+    pub fn include_system(&self) -> bool {
+        self.include_system
+    }
+
+    pub fn set_include_system(&mut self, include: bool) {
+        self.include_system = include;
+    }
+
+    pub fn set_max_size(&mut self, size: usize) {
+        self.max_size = size;
+        if self.max_size > 0 && self.messages.len() > self.max_size {
+            if self.include_system {
+                // find system message if it will be excluded from history
+                for i in 0..(self.messages.len() - self.max_size) {
+                    if self.messages[i].role == "system" {
+                        self.system_message = Some(self.messages[i].clone());
+                        break;
+                    }
+                }
+            }
+            self.messages = self.messages[self.messages.len() - self.max_size..].to_vec();
+        }
+    }
+
+    pub fn push(&mut self, message: Message) {
+        // If the message is the same as the last one, update it instead of adding a new one
+        if message.id.is_some() && !self.messages.is_empty() {
+            let last_index = self.messages.len() - 1;
+            let last_message = &mut self.messages[last_index];
+            if last_message.id.is_some() && last_message.id == message.id {
+                last_message.content = message.content;
+                return;
+            }
+        }
+
+        if self.max_size > 0 && self.messages.len() >= self.max_size {
+            let m = self.messages.remove(0);
+            if m.role == "system" {
+                self.system_message = Some(m);
+            }
+        }
+        self.messages.push(message);
+    }
+
+    pub fn reset(&mut self) {
+        self.messages.clear();
+        self.system_message = None;
+    }
 }
 
 impl From<MessageHistory> for AgentValue {
@@ -247,16 +260,17 @@ impl From<MessageHistory> for AgentValue {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
+
+    // Message tests
 
     #[test]
     fn test_message_to_from_agent_value() {
         let msg = Message::user("What is the weather today?".to_string());
         let value: AgentValue = msg.clone().into();
         let msg_converted: Message = value.try_into().unwrap();
-        assert_eq!(msg.role, msg_converted.role);
-        assert_eq!(msg.content, msg_converted.content);
+        assert_eq!(msg_converted.role, "user");
+        assert_eq!(msg_converted.content, "What is the weather today?");
     }
 
     #[test]
@@ -285,6 +299,40 @@ mod tests {
     }
 
     #[test]
+    fn test_message_from_invalid_value() {
+        let value = AgentValue::integer(42);
+        let result: Result<Message, AgentError> = value.try_into();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_message_invalid_object() {
+        let value =
+            AgentValue::object([("some_key".to_string(), AgentValue::string("some_value"))].into());
+        let result: Result<Message, AgentError> = value.try_into();
+        assert!(result.is_err());
+    }
+
+    // MessageHistory tests
+
+    const SAMPLE_HISTORY: &str = r#"
+    [
+        { "role": "system", "content": "You are a helpful assistant." },
+        { "role": "user", "content": "Hello" },
+        { "role": "assistant", "content": "Hi there!" }
+    ]"#;
+
+    #[test]
+    fn test_message_history_new() {
+        let history = MessageHistory::new(vec![], 0);
+        assert_eq!(history.messages.len(), 0);
+        assert_eq!(history.max_size, 0);
+        assert_eq!(history.include_system, false);
+        assert!(history.system_message.is_none());
+        assert_eq!(history.preamble.len(), 0);
+    }
+
+    #[test]
     fn test_message_history_from_json() {
         let value: serde_json::Value = serde_json::json!([
             { "role": "user", "content": "Hello" },
@@ -300,28 +348,134 @@ mod tests {
 
     #[test]
     fn test_message_history_parse() {
-        let history = MessageHistory::parse(
-            r#"[{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi there!"}]"#,
-        ).unwrap();
-        assert_eq!(history.messages.len(), 2);
-        assert_eq!(history.messages[0].role, "user");
-        assert_eq!(history.messages[0].content, "Hello");
-        assert_eq!(history.messages[1].role, "assistant");
-        assert_eq!(history.messages[1].content, "Hi there!");
+        let history = MessageHistory::parse(SAMPLE_HISTORY).unwrap();
+        assert_eq!(history.messages.len(), 3);
+        assert_eq!(history.messages[0].role, "system");
+        assert_eq!(history.messages[0].content, "You are a helpful assistant.");
+        assert_eq!(history.messages[1].role, "user");
+        assert_eq!(history.messages[1].content, "Hello");
+        assert_eq!(history.messages[2].role, "assistant");
+        assert_eq!(history.messages[2].content, "Hi there!");
     }
 
     #[test]
-    fn test_message_from_invalid_value() {
-        let value = AgentValue::integer(42);
-        let result: Result<Message, AgentError> = value.try_into();
-        assert!(result.is_err());
+    fn test_message_history_include_system() {
+        let mut history = MessageHistory::new(vec![], 0);
+        assert_eq!(history.include_system(), false);
+        history.set_include_system(true);
+        assert_eq!(history.include_system(), true);
     }
 
     #[test]
-    fn test_message_invalid_object() {
-        let value =
-            AgentValue::object([("some_key".to_string(), AgentValue::string("some_value"))].into());
-        let result: Result<Message, AgentError> = value.try_into();
-        assert!(result.is_err());
+    fn test_message_history_set_max_size() {
+        let mut history = MessageHistory::parse(SAMPLE_HISTORY).unwrap();
+        assert_eq!(history.max_size, 0);
+        assert_eq!(history.messages.len(), 3);
+
+        history.set_max_size(5);
+        assert_eq!(history.max_size, 5);
+        assert_eq!(history.messages.len(), 3);
+
+        history.set_max_size(1);
+        assert_eq!(history.max_size, 1);
+        let msgs = history.messages();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, "assistant");
+    }
+
+    #[test]
+    fn test_message_history_set_max_size_with_include_system() {
+        let mut history = MessageHistory::parse(SAMPLE_HISTORY).unwrap();
+        history.set_include_system(true);
+        assert_eq!(history.max_size, 0);
+        assert_eq!(history.messages.len(), 3);
+
+        history.set_max_size(5);
+        assert_eq!(history.max_size, 5);
+        assert_eq!(history.messages.len(), 3);
+
+        history.set_max_size(1);
+        assert_eq!(history.max_size, 1);
+        assert_eq!(history.messages.len(), 1);
+        assert!(history.system_message.is_some());
+        let msgs = history.messages();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[1].role, "assistant");
+    }
+
+    #[test]
+    fn test_message_history_push() {
+        let mut history = MessageHistory::parse(SAMPLE_HISTORY).unwrap();
+        let new_msg = Message::user("How are you?".to_string());
+        history.push(new_msg);
+        let msgs = history.messages();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[3].role, "user");
+        assert_eq!(msgs[3].content, "How are you?");
+    }
+
+    #[test]
+    fn test_message_history_push_with_include_system() {
+        let mut history = MessageHistory::parse(SAMPLE_HISTORY).unwrap();
+        history.set_include_system(true);
+        history.set_max_size(3);
+        assert_eq!(history.messages.len(), 3);
+        assert!(history.system_message.is_none());
+
+        let new_msg = Message::user("How are you?".to_string());
+        history.push(new_msg);
+        assert_eq!(history.messages.len(), 3);
+        assert!(history.system_message.is_some());
+
+        let msgs = history.messages();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[3].role, "user");
+
+        let new_msg = Message::assistant("Good!".to_string());
+        history.push(new_msg);
+        assert_eq!(history.messages.len(), 3);
+        assert!(history.system_message.is_some());
+
+        let msgs = history.messages();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[3].role, "assistant");
+    }
+
+    #[test]
+    fn test_message_history_push_update_last() {
+        let mut history =
+            MessageHistory::parse(r#"[{"role": "user", "content": "Hello", "id": "msg1"}]"#)
+                .unwrap();
+        let updated_msg = Message {
+            role: "user".to_string(),
+            content: "Hello, updated!".to_string(),
+            id: Some("msg1".to_string()),
+            #[cfg(feature = "image")]
+            image: None,
+        };
+        history.push(updated_msg);
+        let msgs = history.messages();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "Hello, updated!");
+    }
+
+    #[test]
+    fn test_message_history_reset() {
+        let mut history = MessageHistory::parse(SAMPLE_HISTORY).unwrap();
+        assert_eq!(history.messages.len(), 3);
+        history.reset();
+        assert_eq!(history.messages.len(), 0);
+
+        // with include_system
+        let mut history = MessageHistory::parse(SAMPLE_HISTORY).unwrap();
+        history.set_include_system(true);
+        history.set_max_size(2);
+        assert!(history.system_message.is_some());
+        history.reset();
+        assert_eq!(history.messages.len(), 0);
+        assert!(history.system_message.is_none());
     }
 }
