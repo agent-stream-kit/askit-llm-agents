@@ -8,11 +8,11 @@ use crate::message::{Message, MessageHistory};
 
 static CATEGORY: &str = "LLM";
 
-static PORT_MESSAGE: &str = "message";
-static PORT_MESSAGES: &str = "messages";
-static PORT_MESSAGE_HISTORY: &str = "message_history";
-static PORT_HISTORY: &str = "history";
-static PORT_RESET: &str = "reset";
+static PIN_MESSAGE: &str = "message";
+static PIN_MESSAGES: &str = "messages";
+static PIN_MESSAGE_HISTORY: &str = "message_history";
+static PIN_HISTORY: &str = "history";
+static PIN_RESET: &str = "reset";
 
 static CONFIG_HISTORY_SIZE: &str = "history_size";
 static CONFIG_MESSAGE: &str = "message";
@@ -23,8 +23,8 @@ static CONFIG_INCLUDE_SYSTZEM: &str = "include_system";
 #[askit_agent(
     title="Assistant Message",
     category=CATEGORY,
-    inputs=[PORT_MESSAGES],
-    outputs=[PORT_MESSAGES],
+    inputs=[PIN_MESSAGES],
+    outputs=[PIN_MESSAGES],
     text_config(name=CONFIG_MESSAGE)
 )]
 pub struct AssistantMessageAgent {
@@ -53,7 +53,7 @@ impl AsAgent for AssistantMessageAgent {
         let message = self.configs()?.get_string(CONFIG_MESSAGE)?;
         let message = Message::assistant(message);
         let messages = add_message(value, message);
-        self.try_output(ctx, PORT_MESSAGES, messages)?;
+        self.try_output(ctx, PIN_MESSAGES, messages)?;
         Ok(())
     }
 }
@@ -62,8 +62,8 @@ impl AsAgent for AssistantMessageAgent {
 #[askit_agent(
     title="System Message",
     category=CATEGORY,
-    inputs=[PORT_MESSAGES],
-    outputs=[PORT_MESSAGES],
+    inputs=[PIN_MESSAGES],
+    outputs=[PIN_MESSAGES],
     text_config(name=CONFIG_MESSAGE)
 )]
 pub struct SystemMessageAgent {
@@ -92,7 +92,7 @@ impl AsAgent for SystemMessageAgent {
         let message = self.configs()?.get_string(CONFIG_MESSAGE)?;
         let message = Message::system(message);
         let messages = add_message(value, message);
-        self.try_output(ctx, PORT_MESSAGES, messages)?;
+        self.try_output(ctx, PIN_MESSAGES, messages)?;
         Ok(())
     }
 }
@@ -101,8 +101,8 @@ impl AsAgent for SystemMessageAgent {
 #[askit_agent(
     title="User Message",
     category=CATEGORY,
-    inputs=[PORT_MESSAGES],
-    outputs=[PORT_MESSAGES],
+    inputs=[PIN_MESSAGES],
+    outputs=[PIN_MESSAGES],
     text_config(name=CONFIG_MESSAGE)
 )]
 pub struct UserMessageAgent {
@@ -131,7 +131,7 @@ impl AsAgent for UserMessageAgent {
         let message = self.configs()?.get_string(CONFIG_MESSAGE)?;
         let message = Message::user(message);
         let messages = add_message(value, message);
-        self.try_output(ctx, PORT_MESSAGES, messages)?;
+        self.try_output(ctx, PIN_MESSAGES, messages)?;
         Ok(())
     }
 }
@@ -172,8 +172,8 @@ fn add_message(value: AgentValue, message: Message) -> AgentValue {
 #[askit_agent(
     title="Message History",
     category=CATEGORY,
-    inputs=[PORT_MESSAGE, PORT_RESET],
-    outputs=[PORT_MESSAGE_HISTORY, PORT_HISTORY],
+    inputs=[PIN_MESSAGE, PIN_RESET],
+    outputs=[PIN_MESSAGE_HISTORY, PIN_HISTORY],
     boolean_config(
         name=CONFIG_INCLUDE_SYSTZEM,
         title="Include System"
@@ -184,7 +184,7 @@ fn add_message(value: AgentValue, message: Message) -> AgentValue {
 pub struct MessageHistoryAgent {
     data: AgentData,
     history: MessageHistory,
-    first_run: bool,
+    preamble_included: bool,
 }
 
 #[async_trait]
@@ -198,7 +198,7 @@ impl AsAgent for MessageHistoryAgent {
         Ok(Self {
             data: AgentData::new(askit, id, def_name, config),
             history: MessageHistory::new(vec![], 0),
-            first_run: true,
+            preamble_included: false,
         })
     }
 
@@ -208,25 +208,23 @@ impl AsAgent for MessageHistoryAgent {
         pin: String,
         value: AgentValue,
     ) -> Result<(), AgentError> {
-        if pin == PORT_RESET {
-            self.first_run = true;
-            self.history.reset();
+        if pin == PIN_RESET {
+            self.history = MessageHistory::new(vec![], 0);
+            self.preamble_included = false;
             return Ok(());
         }
 
         let history_size = self.configs()?.get_integer_or_default(CONFIG_HISTORY_SIZE) as usize;
-
         self.history.set_max_size(history_size);
 
-        if self.first_run {
-            // On first run, load preamble messages if any
-            self.first_run = false;
+        if !self.preamble_included {
+            self.preamble_included = true;
             let preamble_str = self.configs()?.get_string_or_default(CONFIG_PREAMBLE);
             if !preamble_str.is_empty() {
                 let preamble_history = MessageHistory::parse(&preamble_str).map_err(|e| {
                     AgentError::InvalidValue(format!("Failed to parse preamble messages: {}", e))
                 })?;
-                self.history = preamble_history;
+                self.history.set_preamble(preamble_history.messages());
             }
         }
 
@@ -235,7 +233,7 @@ impl AsAgent for MessageHistoryAgent {
         })?;
 
         self.history.push(message.clone());
-        self.try_output(ctx.clone(), PORT_HISTORY, self.history.clone().into())?;
+        self.try_output(ctx.clone(), PIN_HISTORY, self.history.clone().into())?;
 
         if message.role != "user" {
             return Ok(());
@@ -258,7 +256,7 @@ impl AsAgent for MessageHistoryAgent {
             ]
             .into(),
         );
-        self.try_output(ctx, PORT_MESSAGE_HISTORY, messages)?;
+        self.try_output(ctx, PIN_MESSAGE_HISTORY, messages)?;
 
         Ok(())
     }

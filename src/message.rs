@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, vec};
 
 use agent_stream_kit::{AgentError, AgentValue};
 use serde::{Deserialize, Serialize};
@@ -137,33 +137,21 @@ pub struct MessageHistory {
     max_size: usize,
     system_message: Option<Message>,
     include_system: bool,
-    preamble: Vec<Message>,
 }
 
 impl MessageHistory {
     pub fn new(messages: Vec<Message>, max_size: usize) -> Self {
-        let mut messages = messages;
-        let mut system_message = None;
-        if max_size > 0 {
-            if messages.len() > max_size {
-                // find system message if it will be excluded from history
-                for i in 0..(messages.len() - max_size) {
-                    if messages[i].role == "system" {
-                        system_message = Some(messages[i].clone());
-                    }
-                }
-                messages = messages[messages.len() - max_size..].to_vec();
-            }
-        }
-        Self {
+        let mut hist = Self {
             messages,
-            max_size,
-            system_message,
+            max_size: 0,
+            system_message: None,
             include_system: false,
-            preamble: Vec::new(),
-        }
+        };
+        hist.set_max_size(max_size);
+        hist
     }
 
+    /// Create MessageHistory from a JSON value
     pub fn from_json(value: serde_json::Value) -> Result<Self, AgentError> {
         match value {
             serde_json::Value::Array(arr) => {
@@ -182,6 +170,7 @@ impl MessageHistory {
         }
     }
 
+    /// Parse MessageHistory from a JSON string
     pub fn parse(s: &str) -> Result<Self, AgentError> {
         let value: serde_json::Value = serde_json::from_str(s).map_err(|e| {
             AgentError::InvalidValue(format!("Failed to parse JSON for MessageHistory: {}", e))
@@ -189,9 +178,10 @@ impl MessageHistory {
         Self::from_json(value)
     }
 
+    /// Get the messages in the history, including system message if configured.
     pub fn messages(&self) -> Vec<Message> {
+        let mut msgs = Vec::new();
         if self.include_system {
-            let mut msgs = Vec::new();
             if let Some(sys_msg) = &self.system_message {
                 msgs.push(sys_msg.clone());
             }
@@ -210,6 +200,10 @@ impl MessageHistory {
         self.include_system = include;
     }
 
+    /// Set the maximum size of the message history.
+    /// If max_size is 0, there is no limit.
+    /// If the current size exceeds the new maximum, the oldest messages will be removed.
+    /// If include_system is true, the system message will be preserved.
     pub fn set_max_size(&mut self, size: usize) {
         self.max_size = size;
         if self.max_size > 0 && self.messages.len() > self.max_size {
@@ -226,6 +220,22 @@ impl MessageHistory {
         }
     }
 
+    pub fn set_preamble(&mut self, preamble: Vec<Message>) {
+        if preamble.is_empty() {
+            return;
+        }
+        let mut msgs = vec![];
+        msgs.extend(preamble.clone());
+        msgs.extend(self.messages.clone());
+        self.messages = msgs;
+        self.system_message = None;
+        self.set_max_size(self.max_size);
+    }
+
+    /// Push a new message to the history.
+    /// If the message has the same ID as the last message, it will update the last message instead.
+    /// If the history exceeds max_size, the oldest message will be removed.
+    /// If include_system is true and the removed message is a system message, it will be preserved.
     pub fn push(&mut self, message: Message) {
         // If the message is the same as the last one, update it instead of adding a new one
         if message.id.is_some() && !self.messages.is_empty() {
@@ -245,16 +255,11 @@ impl MessageHistory {
         }
         self.messages.push(message);
     }
-
-    pub fn reset(&mut self) {
-        self.messages.clear();
-        self.system_message = None;
-    }
 }
 
 impl From<MessageHistory> for AgentValue {
     fn from(history: MessageHistory) -> Self {
-        AgentValue::array(history.messages().into_iter().map(|m| m.into()).collect())
+        AgentValue::array(history.messages.into_iter().map(|m| m.into()).collect())
     }
 }
 
@@ -329,7 +334,6 @@ mod tests {
         assert_eq!(history.max_size, 0);
         assert_eq!(history.include_system, false);
         assert!(history.system_message.is_none());
-        assert_eq!(history.preamble.len(), 0);
     }
 
     #[test]
@@ -460,22 +464,5 @@ mod tests {
         let msgs = history.messages();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "Hello, updated!");
-    }
-
-    #[test]
-    fn test_message_history_reset() {
-        let mut history = MessageHistory::parse(SAMPLE_HISTORY).unwrap();
-        assert_eq!(history.messages.len(), 3);
-        history.reset();
-        assert_eq!(history.messages.len(), 0);
-
-        // with include_system
-        let mut history = MessageHistory::parse(SAMPLE_HISTORY).unwrap();
-        history.set_include_system(true);
-        history.set_max_size(2);
-        assert!(history.system_message.is_some());
-        history.reset();
-        assert_eq!(history.messages.len(), 0);
-        assert!(history.system_message.is_none());
     }
 }

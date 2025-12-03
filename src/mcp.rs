@@ -3,8 +3,8 @@
 use std::vec;
 
 use agent_stream_kit::{
-    ASKit, Agent, AgentConfigs, AgentContext, AgentError, AgentOutput, AgentValue, AsAgent,
-    AgentData, async_trait,
+    ASKit, Agent, AgentConfigs, AgentContext, AgentData, AgentError, AgentOutput, AgentValue,
+    AsAgent, async_trait,
 };
 use askit_macros::askit_agent;
 use rmcp::{
@@ -16,8 +16,8 @@ use tokio::process::Command;
 
 static CATEGORY: &str = "LLM";
 
-static PORT_OBJECT: &str = "object";
-static PORT_RESPONSE: &str = "response";
+static PIN_VALUE: &str = "value";
+static PIN_RESPONSE: &str = "response";
 
 static CONFIG_COMMAND: &str = "command";
 static CONFIG_ARGS: &str = "args";
@@ -27,8 +27,8 @@ static CONFIG_TOOL: &str = "tool";
 #[askit_agent(
     title="MCP Call",
     category=CATEGORY,
-    inputs=[PORT_OBJECT],
-    outputs=[PORT_OBJECT, PORT_RESPONSE],
+    inputs=[PIN_VALUE],
+    outputs=[PIN_VALUE, PIN_RESPONSE],
     string_config(name=CONFIG_COMMAND),
     string_config(name=CONFIG_ARGS),
     string_config(name=CONFIG_TOOL),
@@ -104,7 +104,7 @@ impl AsAgent for MCPCallAgent {
 
         self.try_output(
             ctx.clone(),
-            PORT_OBJECT,
+            PIN_VALUE,
             call_tool_result_to_agent_data(tool_result.clone())?,
         )?;
 
@@ -113,7 +113,7 @@ impl AsAgent for MCPCallAgent {
                 "Failed to serialize tool result content to JSON: {e}"
             ))
         })?;
-        self.try_output(ctx, PORT_RESPONSE, AgentValue::string(response))?;
+        self.try_output(ctx, PIN_RESPONSE, AgentValue::string(response))?;
 
         Ok(())
     }

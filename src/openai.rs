@@ -26,10 +26,10 @@ use crate::message::Message;
 
 static CATEGORY: &str = "LLM";
 
-static PORT_EMBEDDINGS: &str = "embeddings";
-static PORT_INPUT: &str = "input";
-static PORT_MESSAGE: &str = "message";
-static PORT_RESPONSE: &str = "response";
+static PIN_EMBEDDINGS: &str = "embeddings";
+static PIN_INPUT: &str = "input";
+static PIN_MESSAGE: &str = "message";
+static PIN_RESPONSE: &str = "response";
 
 static CONFIG_MODEL: &str = "model";
 static CONFIG_OPENAI_API_KEY: &str = "openai_api_key";
@@ -78,8 +78,8 @@ impl OpenAIManager {
 #[askit_agent(
     title="OpenAI Completion",
     category=CATEGORY,
-    inputs=[PORT_MESSAGE],
-    outputs=[PORT_MESSAGE, PORT_RESPONSE],
+    inputs=[PIN_MESSAGE],
+    outputs=[PIN_MESSAGE, PIN_RESPONSE],
     string_config(name=CONFIG_MODEL, default="gpt-3.5-turbo-instruct"),
     text_config(name=CONFIG_OPTIONS, default="{}"),
     string_global_config(name=CONFIG_OPENAI_API_KEY, title="OpenAI API Key")
@@ -177,10 +177,10 @@ impl AsAgent for OpenAICompletionAgent {
             .map_err(|e| AgentError::IoError(format!("OpenAI Error: {}", e)))?;
 
         let message = Message::assistant(res.choices[0].text.clone());
-        self.try_output(ctx.clone(), PORT_MESSAGE, message.into())?;
+        self.try_output(ctx.clone(), PIN_MESSAGE, message.into())?;
 
         let out_response = AgentValue::from_serialize(&res)?;
-        self.try_output(ctx, PORT_RESPONSE, out_response)?;
+        self.try_output(ctx, PIN_RESPONSE, out_response)?;
 
         Ok(())
     }
@@ -190,8 +190,8 @@ impl AsAgent for OpenAICompletionAgent {
 #[askit_agent(
     title="OpenAI Chat",
     category=CATEGORY,
-    inputs=[PORT_MESSAGE],
-    outputs=[PORT_MESSAGE, PORT_RESPONSE],
+    inputs=[PIN_MESSAGE],
+    outputs=[PIN_MESSAGE, PIN_RESPONSE],
     string_config(name=CONFIG_MODEL, default=DEFAULT_CONFIG_MODEL),
     boolean_config(name=CONFIG_STREAM, title="Stream"),
     text_config(name=CONFIG_OPTIONS, default="{}")
@@ -315,10 +315,10 @@ impl AsAgent for OpenAIChatAgent {
 
                 let mut message = Message::assistant(content.clone());
                 message.id = Some(res.id.clone());
-                self.try_output(ctx.clone(), PORT_MESSAGE, message.into())?;
+                self.try_output(ctx.clone(), PIN_MESSAGE, message.into())?;
 
                 let out_response = AgentValue::from_serialize(&res)?;
-                self.try_output(ctx.clone(), PORT_RESPONSE, out_response)?;
+                self.try_output(ctx.clone(), PIN_RESPONSE, out_response)?;
             }
         } else {
             let res = client
@@ -336,10 +336,10 @@ impl AsAgent for OpenAIChatAgent {
 
             let mut res_message = Message::assistant(content);
             res_message.id = Some(res.id.clone());
-            self.try_output(ctx.clone(), PORT_MESSAGE, res_message.clone().into())?;
+            self.try_output(ctx.clone(), PIN_MESSAGE, res_message.clone().into())?;
 
             let out_response = AgentValue::from_serialize(&res)?;
-            self.try_output(ctx.clone(), PORT_RESPONSE, out_response)?;
+            self.try_output(ctx.clone(), PIN_RESPONSE, out_response)?;
         }
 
         Ok(())
@@ -350,8 +350,8 @@ impl AsAgent for OpenAIChatAgent {
 #[askit_agent(
     title="OpenAI Embeddings",
     category=CATEGORY,
-    inputs=[PORT_INPUT],
-    outputs=[PORT_EMBEDDINGS],
+    inputs=[PIN_INPUT],
+    outputs=[PIN_EMBEDDINGS],
     string_config(name=CONFIG_MODEL, default="text-embedding-3-small"),
     text_config(name=CONFIG_OPTIONS, default="{}")
 )]
@@ -424,7 +424,7 @@ impl AsAgent for OpenAIEmbeddingsAgent {
             .map_err(|e| AgentError::IoError(format!("OpenAI Error: {}", e)))?;
 
         let value = AgentValue::from_serialize(&res.data)?;
-        self.try_output(ctx.clone(), PORT_EMBEDDINGS, value)?;
+        self.try_output(ctx.clone(), PIN_EMBEDDINGS, value)?;
 
         Ok(())
     }
@@ -435,8 +435,8 @@ impl AsAgent for OpenAIEmbeddingsAgent {
 #[askit_agent(
     title="OpenAI Responses",
     category=CATEGORY,
-    inputs=[PORT_MESSAGE],
-    outputs=[PORT_MESSAGE, PORT_RESPONSE],
+    inputs=[PIN_MESSAGE],
+    outputs=[PIN_MESSAGE, PIN_RESPONSE],
     string_config(name=CONFIG_MODEL, default=DEFAULT_CONFIG_MODEL),
     boolean_config(name=CONFIG_STREAM, title="Stream"),
     text_config(name=CONFIG_OPTIONS, default="{}"),
@@ -561,7 +561,7 @@ impl AsAgent for OpenAIResponsesAgent {
                     }
                     responses::ResponseEvent::ResponseCompleted(_) => {
                         let out_response = AgentValue::from_serialize(&res_event)?;
-                        self.try_output(ctx.clone(), PORT_RESPONSE, out_response)?;
+                        self.try_output(ctx.clone(), PIN_RESPONSE, out_response)?;
                         break;
                     }
                     _ => {}
@@ -569,10 +569,10 @@ impl AsAgent for OpenAIResponsesAgent {
 
                 let mut message = Message::assistant(content.clone());
                 message.id = id.clone();
-                self.try_output(ctx.clone(), PORT_MESSAGE, message.into())?;
+                self.try_output(ctx.clone(), PIN_MESSAGE, message.into())?;
 
                 let out_response = AgentValue::from_serialize(&res_event)?;
-                self.try_output(ctx.clone(), PORT_RESPONSE, out_response)?;
+                self.try_output(ctx.clone(), PIN_RESPONSE, out_response)?;
             }
         } else {
             let res = client
@@ -583,10 +583,10 @@ impl AsAgent for OpenAIResponsesAgent {
 
             let mut res_message: Message = Message::assistant(get_output_text(&res)); // TODO: better conversion
             res_message.id = Some(res.id.clone());
-            self.try_output(ctx.clone(), PORT_MESSAGE, res_message.clone().into())?;
+            self.try_output(ctx.clone(), PIN_MESSAGE, res_message.clone().into())?;
 
             let out_response = AgentValue::from_serialize(&res)?;
-            self.try_output(ctx.clone(), PORT_RESPONSE, out_response)?;
+            self.try_output(ctx.clone(), PIN_RESPONSE, out_response)?;
         }
 
         Ok(())
