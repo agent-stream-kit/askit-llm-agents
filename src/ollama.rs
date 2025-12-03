@@ -28,7 +28,9 @@ static CATEGORY: &str = "LLM";
 static PIN_EMBEDDINGS: &str = "embeddings";
 static PIN_INPUT: &str = "input";
 static PIN_MESSAGE: &str = "message";
+static PIN_MODEL_LIST: &str = "model_list";
 static PIN_RESPONSE: &str = "response";
+static PIN_UNIT: &str = "unit";
 
 static CONFIG_MODEL: &str = "model";
 static CONFIG_OLLAMA_URL: &str = "ollama_url";
@@ -366,6 +368,50 @@ impl AsAgent for OllamaEmbeddingsAgent {
         let embeddings = AgentValue::from_serialize(&res.embeddings)?;
         self.try_output(ctx.clone(), PIN_EMBEDDINGS, embeddings)?;
 
+        Ok(())
+    }
+}
+
+// Ollama List Local Models
+#[askit_agent(
+    title="Ollama List Local Models",
+    category=CATEGORY,
+    inputs=[PIN_UNIT],
+    outputs=[PIN_MODEL_LIST],
+)]
+pub struct OllamaListLocalModelsAgent {
+    data: AgentData,
+    manager: OllamaManager,
+}
+
+#[async_trait]
+impl AsAgent for OllamaListLocalModelsAgent {
+    fn new(
+        askit: ASKit,
+        id: String,
+        def_name: String,
+        config: Option<AgentConfigs>,
+    ) -> Result<Self, AgentError> {
+        Ok(Self {
+            data: AgentData::new(askit, id, def_name, config),
+            manager: OllamaManager::new(),
+        })
+    }
+
+    async fn process(
+        &mut self,
+        ctx: AgentContext,
+        _pin: String,
+        _value: AgentValue,
+    ) -> Result<(), AgentError> {
+        let client = self.manager.get_client(self.askit())?;
+        let model_list = client
+            .list_local_models()
+            .await
+            .map_err(|e| AgentError::IoError(format!("Ollama Error: {}", e)))?;
+        let model_list = AgentValue::from_serialize(&model_list)?;
+
+        self.try_output(ctx.clone(), PIN_MODEL_LIST, model_list)?;
         Ok(())
     }
 }
