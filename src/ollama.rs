@@ -19,6 +19,7 @@ use ollama_rs::{
     history::ChatHistory,
     models::ModelOptions,
 };
+use rmcp::model;
 use tokio_stream::StreamExt;
 
 use crate::message::{Message, MessageHistory};
@@ -28,7 +29,9 @@ static CATEGORY: &str = "LLM";
 static PIN_EMBEDDINGS: &str = "embeddings";
 static PIN_INPUT: &str = "input";
 static PIN_MESSAGE: &str = "message";
+static PIN_MODEL_INFO: &str = "model_info";
 static PIN_MODEL_LIST: &str = "model_list";
+static PIN_MODEL_NAME: &str = "model_name";
 static PIN_RESPONSE: &str = "response";
 static PIN_UNIT: &str = "unit";
 
@@ -412,6 +415,55 @@ impl AsAgent for OllamaListLocalModelsAgent {
         let model_list = AgentValue::from_serialize(&model_list)?;
 
         self.try_output(ctx.clone(), PIN_MODEL_LIST, model_list)?;
+        Ok(())
+    }
+}
+
+// Ollama Show Model Info
+#[askit_agent(
+    title="Ollama Show Model Info",
+    category=CATEGORY,
+    inputs=[PIN_MODEL_NAME],
+    outputs=[PIN_MODEL_INFO],
+)]
+pub struct OllamaShowModelInfoAgent {
+    data: AgentData,
+    manager: OllamaManager,
+}
+
+#[async_trait]
+impl AsAgent for OllamaShowModelInfoAgent {
+    fn new(
+        askit: ASKit,
+        id: String,
+        def_name: String,
+        config: Option<AgentConfigs>,
+    ) -> Result<Self, AgentError> {
+        Ok(Self {
+            data: AgentData::new(askit, id, def_name, config),
+            manager: OllamaManager::new(),
+        })
+    }
+
+    async fn process(
+        &mut self,
+        ctx: AgentContext,
+        _pin: String,
+        value: AgentValue,
+    ) -> Result<(), AgentError> {
+        let model_name = value.as_str().unwrap_or(""); // TODO: other types
+        if model_name.is_empty() {
+            return Ok(());
+        }
+
+        let client = self.manager.get_client(self.askit())?;
+        let model_info = client
+            .show_model_info(model_name.to_string())
+            .await
+            .map_err(|e| AgentError::IoError(format!("Ollama Error: {}", e)))?;
+        let model_info = AgentValue::from_serialize(&model_info)?;
+
+        self.try_output(ctx.clone(), PIN_MODEL_INFO, model_info)?;
         Ok(())
     }
 }
