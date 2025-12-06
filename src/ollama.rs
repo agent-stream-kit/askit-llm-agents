@@ -5,9 +5,8 @@ use std::vec;
 
 use agent_stream_kit::{
     ASKit, Agent, AgentConfigs, AgentContext, AgentData, AgentError, AgentOutput, AgentValue,
-    AsAgent, async_trait,
+    AsAgent, askit_agent, async_trait,
 };
-use askit_macros::askit_agent;
 
 use ollama_rs::{
     Ollama,
@@ -19,19 +18,22 @@ use ollama_rs::{
     history::ChatHistory,
     models::ModelOptions,
 };
-use rmcp::model;
+use schemars::{Schema, json_schema, schema_for_value};
 use tokio_stream::StreamExt;
 
 use crate::message::{Message, MessageHistory};
+use crate::tool::{self, call_tool, list_tool_infos, list_tool_infos_regex};
 
 static CATEGORY: &str = "LLM";
 
 static PIN_EMBEDDINGS: &str = "embeddings";
+static PIN_HISTORY: &str = "history";
 static PIN_INPUT: &str = "input";
 static PIN_MESSAGE: &str = "message";
 static PIN_MODEL_INFO: &str = "model_info";
 static PIN_MODEL_LIST: &str = "model_list";
 static PIN_MODEL_NAME: &str = "model_name";
+static PIN_RESET: &str = "reset";
 static PIN_RESPONSE: &str = "response";
 static PIN_UNIT: &str = "unit";
 
@@ -40,8 +42,9 @@ static CONFIG_OLLAMA_URL: &str = "ollama_url";
 static CONFIG_OPTIONS: &str = "options";
 static CONFIG_STREAM: &str = "stream";
 static CONFIG_SYSTEM: &str = "system";
+static CONFIG_TOOLS: &str = "tools";
 
-const DEFAULT_CONFIG_MODEL: &str = "gemma3:4b";
+const DEFAULT_CONFIG_MODEL: &str = "gpt-oss:20b";
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 
 // Shared client management for Ollama agents
@@ -173,15 +176,47 @@ impl AsAgent for OllamaCompletionAgent {
 #[askit_agent(
     title="Ollama Chat",
     category=CATEGORY,
-    inputs=[PIN_MESSAGE],
-    outputs=[PIN_MESSAGE, PIN_RESPONSE],
+    inputs=[PIN_MESSAGE, PIN_RESET],
+    outputs=[PIN_MESSAGE, PIN_HISTORY, PIN_RESPONSE],
     string_config(name=CONFIG_MODEL, default=DEFAULT_CONFIG_MODEL),
     boolean_config(name=CONFIG_STREAM, title="Stream"),
+    string_config(name=CONFIG_TOOLS, default=""),
     text_config(name=CONFIG_OPTIONS, default="{}")
 )]
 pub struct OllamaChatAgent {
     data: AgentData,
     manager: OllamaManager,
+    history: MessageHistory,
+}
+
+impl OllamaChatAgent {
+    async fn call_tools(&mut self, ctx: AgentContext, message: Message) -> Result<(), AgentError> {
+        if let Some(tool_calls) = &message.tool_calls {
+            if tool_calls.is_empty() {
+                return Ok(());
+            };
+            let mut resp_messages = vec![];
+
+            for call in tool_calls {
+                let args: AgentValue = AgentValue::from_json(call.function.parameters.clone())
+                    .map_err(|e| {
+                        AgentError::InvalidValue(format!(
+                            "Failed to parse tool call parameters: {}",
+                            e
+                        ))
+                    })?;
+                let tool_resp = call_tool(ctx.clone(), call.function.name.as_str(), args).await?;
+                resp_messages.push(Message::tool(
+                    call.function.name.clone(),
+                    tool_resp.to_json().to_string(),
+                ));
+            }
+            for resp_message in resp_messages {
+                self.history.push(resp_message);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -195,15 +230,22 @@ impl AsAgent for OllamaChatAgent {
         Ok(Self {
             data: AgentData::new(askit, id, def_name, config),
             manager: OllamaManager::new(),
+            history: Default::default(),
         })
     }
 
     async fn process(
         &mut self,
         ctx: AgentContext,
-        _pin: String,
+        pin: String,
         value: AgentValue,
     ) -> Result<(), AgentError> {
+        if pin == PIN_RESET {
+            self.history = MessageHistory::default();
+            self.try_output(ctx, PIN_HISTORY, self.history.clone().into())?;
+            return Ok(());
+        }
+
         let config_model = &self.configs()?.get_string_or_default(CONFIG_MODEL);
         if config_model.is_empty() {
             return Ok(());
@@ -218,25 +260,27 @@ impl AsAgent for OllamaChatAgent {
             }
             messages.push(Message::user(message.to_string()));
         } else if value.is_object() {
-            let obj = value.as_object().unwrap();
-            if obj.contains_key("role") && obj.contains_key("content") {
-                let msg: Message = value.clone().try_into()?;
-                messages.push(msg);
-            } else {
-                if obj.contains_key("history") {
-                    let history_data = obj.get("history").unwrap();
-                    if history_data.is_array() {
-                        let arr = history_data.as_array().unwrap();
-                        for item in arr {
-                            let msg: Message = item.clone().try_into()?;
-                            messages.push(msg);
+            match Message::try_from(value.clone()) {
+                Ok(msg) => {
+                    messages.push(msg);
+                }
+                Err(_) => {
+                    let obj = value.as_object().unwrap();
+                    if obj.contains_key("history") {
+                        let history_data = obj.get("history").unwrap();
+                        if history_data.is_array() {
+                            let arr = history_data.as_array().unwrap();
+                            for item in arr {
+                                let msg: Message = item.clone().try_into()?;
+                                messages.push(msg);
+                            }
                         }
                     }
-                }
-                if obj.contains_key("message") {
-                    let msg_data = obj.get("message").unwrap();
-                    let msg: Message = msg_data.clone().try_into()?;
-                    messages.push(msg);
+                    if obj.contains_key("message") {
+                        let msg_data = obj.get("message").unwrap();
+                        let msg: Message = msg_data.clone().try_into()?;
+                        messages.push(msg);
+                    }
                 }
             }
         }
@@ -245,63 +289,148 @@ impl AsAgent for OllamaChatAgent {
             return Ok(());
         }
 
-        let client = self.manager.get_client(self.askit())?;
-        let mut request = ChatMessageRequest::new(
-            config_model.to_string(),
-            messages.into_iter().map(|m| m.into()).collect(),
-        );
+        for message in messages {
+            self.try_output(ctx.clone(), PIN_MESSAGE, message.clone().into())?;
+            self.history.push(message);
+        }
+        self.try_output(ctx.clone(), PIN_HISTORY, self.history.clone().into())?;
 
-        let config_options = self.configs()?.get_string_or_default(CONFIG_OPTIONS);
-        if !config_options.is_empty() && config_options != "{}" {
-            if let Ok(options_json) = serde_json::from_str::<ModelOptions>(&config_options) {
-                request = request.options(options_json);
-            } else {
-                return Err(AgentError::InvalidValue(
-                    "Invalid JSON in options".to_string(),
-                ));
-            }
+        if self.history.messages().last().unwrap().role != "user" {
+            // If the last message isn’t a user message, just return
+            return Ok(());
         }
 
-        let id = uuid::Uuid::new_v4().to_string();
-        let use_stream = self.configs()?.get_bool_or_default(CONFIG_STREAM);
-        if use_stream {
-            let mut stream = client
-                .send_chat_messages_stream(request)
-                .await
-                .map_err(|e| AgentError::IoError(format!("Ollama Error: {}", e)))?;
+        let config_options = self.configs()?.get_string_or_default(CONFIG_OPTIONS);
+        let options_json = if !config_options.is_empty() && config_options != "{}" {
+            Some(
+                serde_json::from_str::<ModelOptions>(&config_options).map_err(|e| {
+                    AgentError::InvalidValue(format!("Invalid JSON in options: {}", e))
+                })?,
+            )
+        } else {
+            None
+        };
 
-            let mut content = String::new();
-            while let Some(res) = stream.next().await {
-                let res = res.map_err(|_| AgentError::IoError(format!("Ollama Stream Error")))?;
+        let config_tools = self.configs()?.get_string_or_default(CONFIG_TOOLS);
+        let tool_infos = if config_tools.is_empty() {
+            list_tool_infos()
+        } else {
+            let regex = regex::Regex::new(&config_tools).map_err(|e| {
+                AgentError::InvalidValue(format!("Invalid regex in tools config: {}", e))
+            })?;
+            list_tool_infos_regex(&regex)
+        }
+        .into_iter()
+        .map(|tool| tool.into())
+        .collect::<Vec<ollama_rs::generation::tools::ToolInfo>>();
 
-                content.push_str(&res.message.content);
+        let client = self.manager.get_client(self.askit())?;
 
-                let mut message = Message::assistant(content.clone());
+        loop {
+            let mut request = ChatMessageRequest::new(
+                config_model.to_string(),
+                self.history
+                    .messages_for_prompt()
+                    .into_iter()
+                    .map(|m| m.into())
+                    .collect(),
+            );
+
+            if options_json.is_some() {
+                request = request.options(options_json.clone().unwrap());
+            }
+
+            if !tool_infos.is_empty() {
+                request = request.tools(tool_infos.clone());
+            }
+
+            let id = uuid::Uuid::new_v4().to_string();
+            let use_stream = self.configs()?.get_bool_or_default(CONFIG_STREAM);
+            if use_stream {
+                let mut stream = client
+                    .send_chat_messages_stream(request)
+                    .await
+                    .map_err(|e| AgentError::IoError(format!("Ollama Error: {}", e)))?;
+
+                let mut message = Message::assistant("".to_string());
+                let mut content = String::new();
+                let mut thinking = String::new();
+                let mut tool_calls: Vec<crate::message::ToolCall> = vec![];
+                while let Some(res) = stream.next().await {
+                    let res =
+                        res.map_err(|_| AgentError::IoError(format!("Ollama Stream Error")))?;
+
+                    content.push_str(&res.message.content);
+                    if let Some(thinking_str) = res.message.thinking.as_ref() {
+                        thinking.push_str(thinking_str);
+                    }
+                    if res.message.tool_calls.len() > 0 {
+                        for call in &res.message.tool_calls {
+                            let tool_call = crate::message::ToolCall {
+                                function: crate::message::ToolCallFunction {
+                                    name: call.function.name.clone(),
+                                    parameters: call.function.arguments.clone(),
+                                },
+                            };
+                            tool_calls.push(tool_call);
+                        }
+                    }
+
+                    message = Message::assistant(content.clone());
+                    message.thinking = thinking.clone();
+                    if tool_calls.len() > 0 {
+                        message.tool_calls = Some(tool_calls.clone());
+                    }
+                    message.id = Some(id.clone());
+
+                    self.history.push(message.clone());
+
+                    self.try_output(ctx.clone(), PIN_MESSAGE, message.clone().into())?;
+
+                    let out_response = AgentValue::from_serialize(&res)?;
+                    self.try_output(ctx.clone(), PIN_RESPONSE, out_response)?;
+
+                    self.try_output(ctx.clone(), PIN_HISTORY, self.history.clone().into())?;
+
+                    if res.done {
+                        break;
+                    }
+                }
+
+                // Call tools if any
+                if message.tool_calls.is_some() {
+                    self.call_tools(ctx.clone(), message.clone()).await?;
+                    self.try_output(ctx.clone(), PIN_HISTORY, self.history.clone().into())?;
+                } else {
+                    return Ok(());
+                }
+            } else {
+                let res = client
+                    .send_chat_messages(request)
+                    .await
+                    .map_err(|e| AgentError::IoError(format!("Ollama Error: {}", e)))?;
+
+                let mut message: Message = res.message.clone().into();
                 message.id = Some(id.clone());
-                self.try_output(ctx.clone(), PIN_MESSAGE, message.into())?;
+
+                self.history.push(message.clone());
+
+                self.try_output(ctx.clone(), PIN_MESSAGE, message.clone().into())?;
 
                 let out_response = AgentValue::from_serialize(&res)?;
                 self.try_output(ctx.clone(), PIN_RESPONSE, out_response)?;
 
-                if res.done {
-                    break;
+                self.try_output(ctx.clone(), PIN_HISTORY, self.history.clone().into())?;
+
+                // Call tools if any
+                if message.tool_calls.is_some() {
+                    self.call_tools(ctx.clone(), message.clone()).await?;
+                    self.try_output(ctx.clone(), PIN_HISTORY, self.history.clone().into())?;
+                } else {
+                    return Ok(());
                 }
             }
-        } else {
-            let res = client
-                .send_chat_messages(request)
-                .await
-                .map_err(|e| AgentError::IoError(format!("Ollama Error: {}", e)))?;
-
-            let mut message: Message = res.message.clone().into();
-            message.id = Some(id.clone());
-            self.try_output(ctx.clone(), PIN_MESSAGE, message.into())?;
-
-            let out_response = AgentValue::from_serialize(&res)?;
-            self.try_output(ctx.clone(), PIN_RESPONSE, out_response)?;
         }
-
-        Ok(())
     }
 }
 
@@ -476,8 +605,32 @@ impl From<ChatMessage> for Message {
             MessageRole::System => "system",
             MessageRole::Tool => "tool",
         };
-        Message::new(role.to_string(), msg.content)
-        // TODO: handle images
+        let mut message = Message::new(role.to_string(), msg.content);
+        if !msg.tool_calls.is_empty() {
+            let mut calls = vec![];
+            for call in msg.tool_calls {
+                let tool_call = crate::message::ToolCall {
+                    function: crate::message::ToolCallFunction {
+                        name: call.function.name,
+                        parameters: call.function.arguments,
+                    },
+                };
+                calls.push(tool_call);
+            }
+            message.tool_calls = Some(calls);
+        }
+        message
+
+        // #[cfg(feature = "image")]
+        // {
+        //     if let Some(images) = msg.images {
+        //         if !images.is_empty() {
+        //             let img = images[0].clone();
+        //             let img_base64 = format!("data:image/png;base64,{}", img.to_base64());
+        //             message.image = Some(crate::message::ImageData::from_base64(img_base64));
+        //         }
+        //     }
+        // }
     }
 }
 
@@ -516,5 +669,24 @@ impl ChatHistory for MessageHistory {
             .map(|msg| msg.clone().into())
             .collect();
         std::borrow::Cow::Owned(messages)
+    }
+}
+
+impl From<tool::ToolInfo> for ollama_rs::generation::tools::ToolInfo {
+    fn from(info: tool::ToolInfo) -> Self {
+        let schema: Schema = if let Some(params) = info.parameters {
+            schema_for_value!(params)
+        } else {
+            json_schema!({})
+        };
+        // let schema = json_schema!({});
+        Self {
+            tool_type: ollama_rs::generation::tools::ToolType::Function,
+            function: ollama_rs::generation::tools::ToolFunctionInfo {
+                name: info.name,
+                description: info.description,
+                parameters: schema,
+            },
+        }
     }
 }

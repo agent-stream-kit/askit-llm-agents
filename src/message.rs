@@ -8,12 +8,21 @@ use photon_rs::PhotonImage;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+
     pub role: String,
 
     pub content: String,
 
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub thinking: String,
+
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
+    pub tool_calls: Option<Vec<ToolCall>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
 
     #[cfg(feature = "image")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -23,9 +32,12 @@ pub struct Message {
 impl Message {
     pub fn new(role: String, content: String) -> Self {
         Self {
+            id: None,
             role,
             content,
-            id: None,
+            thinking: String::new(),
+            tool_calls: None,
+            tool_name: None,
 
             #[cfg(feature = "image")]
             image: None,
@@ -44,11 +56,28 @@ impl Message {
         Message::new("user".to_string(), content)
     }
 
+    pub fn tool(tool_name: String, content: String) -> Self {
+        let mut message = Message::new("tool".to_string(), content);
+        message.tool_name = Some(tool_name);
+        message
+    }
+
     #[cfg(feature = "image")]
     pub fn with_image(mut self, image: Arc<PhotonImage>) -> Self {
         self.image = Some(image);
         self
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub function: ToolCallFunction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallFunction {
+    pub name: String,
+    pub parameters: serde_json::Value,
 }
 
 impl TryFrom<AgentValue> for Message {
@@ -86,6 +115,57 @@ impl TryFrom<AgentValue> for Message {
                 let mut message = Message::new(role, content);
                 message.id = id;
 
+                let thinking = obj
+                    .get("thinking")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                message.thinking = thinking;
+
+                if let Some(tool_name) = obj.get("tool_name") {
+                    message.tool_name = Some(
+                        tool_name
+                            .as_str()
+                            .ok_or_else(|| {
+                                AgentError::InvalidValue(
+                                    "'tool_name' field must be a string".to_string(),
+                                )
+                            })?
+                            .to_string(),
+                    );
+                }
+
+                if let Some(tool_calls) = obj.get("tool_calls") {
+                    let mut calls = vec![];
+                    for call_value in tool_calls.as_array().ok_or_else(|| {
+                        AgentError::InvalidValue("'tool_calls' field must be an array".to_string())
+                    })? {
+                        let function = call_value.get("function").ok_or_else(|| {
+                            AgentError::InvalidValue(
+                                "Tool call missing 'function' field".to_string(),
+                            )
+                        })?;
+                        let tool_name = function.get_str("name").ok_or_else(|| {
+                            AgentError::InvalidValue(
+                                "Tool call function missing 'name' field".to_string(),
+                            )
+                        })?;
+                        let parameters = function.get("parameters").ok_or_else(|| {
+                            AgentError::InvalidValue(
+                                "Tool call function missing 'parameters' field".to_string(),
+                            )
+                        })?;
+                        let call = ToolCall {
+                            function: ToolCallFunction {
+                                name: tool_name.to_string(),
+                                parameters: parameters.to_json(),
+                            },
+                        };
+                        calls.push(call);
+                    }
+                    message.tool_calls = Some(calls);
+                }
+
                 #[cfg(feature = "image")]
                 {
                     if let Some(image_value) = obj.get("image") {
@@ -120,6 +200,23 @@ impl From<Message> for AgentValue {
         ];
         if let Some(id_str) = msg.id {
             fields.push(("id".to_string(), AgentValue::string(id_str)));
+        }
+        if !msg.thinking.is_empty() {
+            fields.push(("thinking".to_string(), AgentValue::string(msg.thinking)));
+        }
+        if let Some(tool_calls) = msg.tool_calls {
+            let calls_value = AgentValue::array(
+                tool_calls
+                    .into_iter()
+                    .map(|call| {
+                        AgentValue::from_serialize(&call).unwrap_or_else(|_| AgentValue::unit())
+                    })
+                    .collect(),
+            );
+            fields.push(("tool_calls".to_string(), calls_value));
+        }
+        if let Some(tool_name) = msg.tool_name {
+            fields.push(("tool_name".to_string(), AgentValue::string(tool_name)));
         }
         #[cfg(feature = "image")]
         {
@@ -192,6 +289,24 @@ impl MessageHistory {
         }
     }
 
+    /// Get the messages for prompt, excluding thinking.
+    pub fn messages_for_prompt(&self) -> Vec<Message> {
+        let mut msgs = Vec::new();
+        if self.include_system {
+            if let Some(sys_msg) = &self.system_message {
+                msgs.push(sys_msg.clone());
+            }
+            for msg in &self.messages {
+                let mut m = msg.clone();
+                m.thinking = String::new();
+                msgs.push(m);
+            }
+            msgs
+        } else {
+            self.messages.clone()
+        }
+    }
+
     pub fn include_system(&self) -> bool {
         self.include_system
     }
@@ -243,6 +358,8 @@ impl MessageHistory {
             let last_message = &mut self.messages[last_index];
             if last_message.id.is_some() && last_message.id == message.id {
                 last_message.content = message.content;
+                last_message.thinking = message.thinking;
+                last_message.tool_calls = message.tool_calls;
                 return;
             }
         }
@@ -272,10 +389,68 @@ mod tests {
     #[test]
     fn test_message_to_from_agent_value() {
         let msg = Message::user("What is the weather today?".to_string());
-        let value: AgentValue = msg.clone().into();
+
+        let value: AgentValue = msg.into();
+        assert_eq!(value.as_object().is_some(), true);
+        assert_eq!(value.get_str("role").unwrap(), "user");
+        assert_eq!(
+            value.get_str("content").unwrap(),
+            "What is the weather today?"
+        );
+
         let msg_converted: Message = value.try_into().unwrap();
         assert_eq!(msg_converted.role, "user");
         assert_eq!(msg_converted.content, "What is the weather today?");
+    }
+
+    #[test]
+    fn test_message_with_tool_calls_to_from_agent_value() {
+        let mut msg = Message::assistant("".to_string());
+        msg.tool_calls = Some(vec![ToolCall {
+            function: ToolCallFunction {
+                name: "get_weather".to_string(),
+                parameters: serde_json::json!({"location": "San Francisco"}),
+            },
+        }]);
+
+        let value: AgentValue = msg.into();
+        assert_eq!(value.as_object().is_some(), true);
+        assert_eq!(value.get_str("role").unwrap(), "assistant");
+        assert_eq!(value.get_str("content").unwrap(), "");
+        let tool_calls = value.get_array("tool_calls").unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        let first_call = tool_calls[0].as_object().unwrap();
+        let function = first_call.get("function").unwrap();
+        assert_eq!(function.get_str("name").unwrap(), "get_weather");
+        let parameters = function.get("parameters").unwrap();
+        assert_eq!(parameters.get_str("location").unwrap(), "San Francisco");
+
+        let msg_converted: Message = value.try_into().unwrap();
+        dbg!(&msg_converted);
+        assert_eq!(msg_converted.role, "assistant");
+        assert_eq!(msg_converted.content, "");
+        let tool_calls = msg_converted.tool_calls.unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "get_weather");
+        assert_eq!(
+            tool_calls[0].function.parameters,
+            serde_json::json!({"location": "San Francisco"})
+        );
+    }
+
+    #[test]
+    fn test_tool_message_to_from_agent_value() {
+        let msg = Message::tool("get_time".to_string(), "2025-01-02 03:04:05".to_string());
+
+        let value: AgentValue = msg.clone().into();
+        assert_eq!(value.get_str("role").unwrap(), "tool");
+        assert_eq!(value.get_str("tool_name").unwrap(), "get_time");
+        assert_eq!(value.get_str("content").unwrap(), "2025-01-02 03:04:05");
+
+        let msg_converted: Message = value.try_into().unwrap();
+        assert_eq!(msg_converted.role, "tool");
+        assert_eq!(msg_converted.tool_name.unwrap(), "get_time");
+        assert_eq!(msg_converted.content, "2025-01-02 03:04:05");
     }
 
     #[test]
@@ -316,6 +491,60 @@ mod tests {
             AgentValue::object([("some_key".to_string(), AgentValue::string("some_value"))].into());
         let result: Result<Message, AgentError> = value.try_into();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_message_to_agent_value_with_tool_calls() {
+        let message = Message {
+            role: "assistant".to_string(),
+            content: "".to_string(),
+            thinking: "".to_string(),
+            tool_calls: Some(vec![ToolCall {
+                function: ToolCallFunction {
+                    name: "active_applications".to_string(),
+                    parameters: serde_json::json!({}),
+                },
+            }]),
+            id: None,
+            tool_name: None,
+            #[cfg(feature = "image")]
+            image: None,
+        };
+
+        let value: AgentValue = message.into();
+        let value_obj = value
+            .as_object()
+            .expect("message converts to object AgentValue");
+
+        assert_eq!(
+            value_obj.get("role").and_then(|v| v.as_str()),
+            Some("assistant")
+        );
+        assert_eq!(value_obj.get("content").and_then(|v| v.as_str()), Some(""));
+
+        let tool_calls = value_obj
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .expect("tool_calls should be serialized");
+        assert_eq!(tool_calls.len(), 1);
+
+        let first_call = tool_calls[0]
+            .as_object()
+            .expect("tool call should serialize as object");
+        let function_obj = first_call
+            .get("function")
+            .and_then(|v| v.as_object())
+            .expect("function should be serialized");
+
+        assert_eq!(
+            function_obj.get("name").and_then(|v| v.as_str()),
+            Some("active_applications")
+        );
+        let parameters = function_obj
+            .get("parameters")
+            .and_then(|v| v.as_object())
+            .expect("parameters should serialize as object");
+        assert!(parameters.is_empty());
     }
 
     // MessageHistory tests
@@ -457,6 +686,9 @@ mod tests {
             role: "user".to_string(),
             content: "Hello, updated!".to_string(),
             id: Some("msg1".to_string()),
+            thinking: "".to_string(),
+            tool_calls: None,
+            tool_name: None,
             #[cfg(feature = "image")]
             image: None,
         };

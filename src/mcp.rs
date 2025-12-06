@@ -14,8 +14,9 @@ use rmcp::{
 };
 use tokio::process::Command;
 
-static CATEGORY: &str = "LLM";
+static CATEGORY: &str = "LLM/MCP";
 
+static PIN_UNIT: &str = "unit";
 static PIN_VALUE: &str = "value";
 static PIN_RESPONSE: &str = "response";
 
@@ -23,7 +24,75 @@ static CONFIG_COMMAND: &str = "command";
 static CONFIG_ARGS: &str = "args";
 static CONFIG_TOOL: &str = "tool";
 
-// MCP Agent
+#[askit_agent(
+    title="MCP Tools List",
+    category=CATEGORY,
+    inputs=[PIN_UNIT],
+    outputs=[PIN_VALUE],
+    string_config(name=CONFIG_COMMAND),
+    string_config(name=CONFIG_ARGS),
+)]
+pub struct MCPToolsListAgent {
+    data: AgentData,
+}
+
+#[async_trait]
+impl AsAgent for MCPToolsListAgent {
+    fn new(
+        askit: ASKit,
+        id: String,
+        def_name: String,
+        config: Option<AgentConfigs>,
+    ) -> Result<Self, AgentError> {
+        Ok(Self {
+            data: AgentData::new(askit, id, def_name, config),
+        })
+    }
+    async fn process(
+        &mut self,
+        ctx: AgentContext,
+        _pin: String,
+        _value: AgentValue,
+    ) -> Result<(), AgentError> {
+        let command = self.configs()?.get_string_or_default(CONFIG_COMMAND);
+        let args_str = self.configs()?.get_string_or_default(CONFIG_ARGS);
+        let args: Vec<String> = serde_json::from_str(&args_str)
+            .map_err(|e| AgentError::InvalidValue(format!("Failed to parse args JSON: {e}")))?;
+
+        let service = ()
+            .serve(
+                TokioChildProcess::new(Command::new(&command).configure(|cmd| {
+                    for arg in &args {
+                        cmd.arg(arg);
+                    }
+                }))
+                .map_err(|e| AgentError::Other(format!("Failed to start MCP process: {e}")))?,
+            )
+            .await
+            .map_err(|e| AgentError::Other(format!("Failed to start MCP service: {e}")))?;
+
+        let tools_list = service
+            .list_tools(Default::default())
+            .await
+            .map_err(|e| AgentError::Other(format!("Failed to list MCP tools: {e}")))?;
+
+        service
+            .cancel()
+            .await
+            .map_err(|e| AgentError::Other(format!("Failed to cancel MCP service: {e}")))?;
+
+        let tools_value = AgentValue::from_serialize(&tools_list).map_err(|e| {
+            AgentError::Other(format!(
+                "Failed to serialize MCP tools list to AgentValue: {e}"
+            ))
+        })?;
+
+        self.try_output(ctx, PIN_VALUE, tools_value)?;
+
+        Ok(())
+    }
+}
+
 #[askit_agent(
     title="MCP Call",
     category=CATEGORY,
@@ -105,7 +174,7 @@ impl AsAgent for MCPCallAgent {
         self.try_output(
             ctx.clone(),
             PIN_VALUE,
-            call_tool_result_to_agent_data(tool_result.clone())?,
+            call_tool_result_to_agent_value(tool_result.clone())?,
         )?;
 
         let response = serde_json::to_string_pretty(&tool_result).map_err(|e| {
@@ -119,7 +188,7 @@ impl AsAgent for MCPCallAgent {
     }
 }
 
-fn call_tool_result_to_agent_data(result: CallToolResult) -> Result<AgentValue, AgentError> {
+fn call_tool_result_to_agent_value(result: CallToolResult) -> Result<AgentValue, AgentError> {
     let mut contents = Vec::new();
     for c in result.content.iter() {
         match &c.raw {
