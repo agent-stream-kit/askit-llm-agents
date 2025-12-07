@@ -21,10 +21,10 @@ use ollama_rs::{
 use schemars::{Schema, json_schema, schema_for_value};
 use tokio_stream::StreamExt;
 
-use crate::message::{Message, MessageHistory};
-use crate::tool::{self, call_tool, list_tool_infos, list_tool_infos_regex};
+use crate::message::{Message, MessageHistory, ToolCall};
+use crate::tool::{self, list_tool_infos, list_tool_infos_regex};
 
-static CATEGORY: &str = "LLM";
+static CATEGORY: &str = "LLM/Ollama";
 
 static PIN_EMBEDDINGS: &str = "embeddings";
 static PIN_HISTORY: &str = "history";
@@ -190,31 +190,13 @@ pub struct OllamaChatAgent {
 }
 
 impl OllamaChatAgent {
-    async fn call_tools(&mut self, ctx: AgentContext, message: Message) -> Result<(), AgentError> {
-        if let Some(tool_calls) = &message.tool_calls {
-            if tool_calls.is_empty() {
-                return Ok(());
-            };
-            let mut resp_messages = vec![];
-
-            for call in tool_calls {
-                let args: AgentValue = AgentValue::from_json(call.function.parameters.clone())
-                    .map_err(|e| {
-                        AgentError::InvalidValue(format!(
-                            "Failed to parse tool call parameters: {}",
-                            e
-                        ))
-                    })?;
-                let tool_resp = call_tool(ctx.clone(), call.function.name.as_str(), args).await?;
-                resp_messages.push(Message::tool(
-                    call.function.name.clone(),
-                    tool_resp.to_json().to_string(),
-                ));
-            }
-            for resp_message in resp_messages {
-                self.history.push(resp_message);
-            }
-        }
+    async fn call_tools(
+        &mut self,
+        ctx: AgentContext,
+        tool_calls: &Vec<ToolCall>,
+    ) -> Result<(), AgentError> {
+        let resp_messages = tool::call_tools(&ctx, tool_calls).await?;
+        self.history.push_all(resp_messages);
         Ok(())
     }
 }
@@ -251,40 +233,7 @@ impl AsAgent for OllamaChatAgent {
             return Ok(());
         }
 
-        let mut messages: Vec<Message> = Vec::new();
-
-        if value.is_string() {
-            let message = value.as_str().unwrap_or("");
-            if message.is_empty() {
-                return Ok(());
-            }
-            messages.push(Message::user(message.to_string()));
-        } else if value.is_object() {
-            match Message::try_from(value.clone()) {
-                Ok(msg) => {
-                    messages.push(msg);
-                }
-                Err(_) => {
-                    let obj = value.as_object().unwrap();
-                    if obj.contains_key("history") {
-                        let history_data = obj.get("history").unwrap();
-                        if history_data.is_array() {
-                            let arr = history_data.as_array().unwrap();
-                            for item in arr {
-                                let msg: Message = item.clone().try_into()?;
-                                messages.push(msg);
-                            }
-                        }
-                    }
-                    if obj.contains_key("message") {
-                        let msg_data = obj.get("message").unwrap();
-                        let msg: Message = msg_data.clone().try_into()?;
-                        messages.push(msg);
-                    }
-                }
-            }
-        }
-
+        let messages = MessageHistory::from_value(value)?.messages();
         if messages.is_empty() {
             return Ok(());
         }
@@ -324,6 +273,8 @@ impl AsAgent for OllamaChatAgent {
         .map(|tool| tool.into())
         .collect::<Vec<ollama_rs::generation::tools::ToolInfo>>();
 
+        let use_stream = self.configs()?.get_bool_or_default(CONFIG_STREAM);
+
         let client = self.manager.get_client(self.askit())?;
 
         loop {
@@ -345,7 +296,6 @@ impl AsAgent for OllamaChatAgent {
             }
 
             let id = uuid::Uuid::new_v4().to_string();
-            let use_stream = self.configs()?.get_bool_or_default(CONFIG_STREAM);
             if use_stream {
                 let mut stream = client
                     .send_chat_messages_stream(request)
@@ -364,16 +314,15 @@ impl AsAgent for OllamaChatAgent {
                     if let Some(thinking_str) = res.message.thinking.as_ref() {
                         thinking.push_str(thinking_str);
                     }
-                    if res.message.tool_calls.len() > 0 {
-                        for call in &res.message.tool_calls {
-                            let tool_call = crate::message::ToolCall {
-                                function: crate::message::ToolCallFunction {
-                                    name: call.function.name.clone(),
-                                    parameters: call.function.arguments.clone(),
-                                },
-                            };
-                            tool_calls.push(tool_call);
-                        }
+                    for call in &res.message.tool_calls {
+                        let tool_call = crate::message::ToolCall {
+                            function: crate::message::ToolCallFunction {
+                                id: None,
+                                name: call.function.name.clone(),
+                                parameters: call.function.arguments.clone(),
+                            },
+                        };
+                        tool_calls.push(tool_call);
                     }
 
                     message = Message::assistant(content.clone());
@@ -398,8 +347,8 @@ impl AsAgent for OllamaChatAgent {
                 }
 
                 // Call tools if any
-                if message.tool_calls.is_some() {
-                    self.call_tools(ctx.clone(), message.clone()).await?;
+                if let Some(tool_calls) = &message.tool_calls {
+                    self.call_tools(ctx.clone(), tool_calls).await?;
                     self.try_output(ctx.clone(), PIN_HISTORY, self.history.clone().into())?;
                 } else {
                     return Ok(());
@@ -423,8 +372,8 @@ impl AsAgent for OllamaChatAgent {
                 self.try_output(ctx.clone(), PIN_HISTORY, self.history.clone().into())?;
 
                 // Call tools if any
-                if message.tool_calls.is_some() {
-                    self.call_tools(ctx.clone(), message.clone()).await?;
+                if let Some(tool_calls) = &message.tool_calls {
+                    self.call_tools(ctx.clone(), tool_calls).await?;
                     self.try_output(ctx.clone(), PIN_HISTORY, self.history.clone().into())?;
                 } else {
                     return Ok(());
@@ -611,6 +560,7 @@ impl From<ChatMessage> for Message {
             for call in msg.tool_calls {
                 let tool_call = crate::message::ToolCall {
                     function: crate::message::ToolCallFunction {
+                        id: None,
                         name: call.function.name,
                         parameters: call.function.arguments,
                     },

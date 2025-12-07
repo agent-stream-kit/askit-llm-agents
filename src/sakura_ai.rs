@@ -15,7 +15,7 @@ use tokio_stream::StreamExt;
 
 use crate::message::Message;
 
-static CATEGORY: &str = "LLM";
+static CATEGORY: &str = "LLM/Sakura";
 
 static PIN_MESSAGE: &str = "message";
 static PIN_RESPONSE: &str = "response";

@@ -15,7 +15,7 @@ pub struct Message {
 
     pub content: String,
 
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(skip_serializing_if = "String::is_empty", default)]
     pub thinking: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,6 +78,9 @@ pub struct ToolCall {
 pub struct ToolCallFunction {
     pub name: String,
     pub parameters: serde_json::Value,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 impl TryFrom<AgentValue> for Message {
@@ -140,6 +143,10 @@ impl TryFrom<AgentValue> for Message {
                     for call_value in tool_calls.as_array().ok_or_else(|| {
                         AgentError::InvalidValue("'tool_calls' field must be an array".to_string())
                     })? {
+                        let id = call_value
+                            .get("id")
+                            .and_then(|i| i.as_str())
+                            .map(|s| s.to_string());
                         let function = call_value.get("function").ok_or_else(|| {
                             AgentError::InvalidValue(
                                 "Tool call missing 'function' field".to_string(),
@@ -157,6 +164,7 @@ impl TryFrom<AgentValue> for Message {
                         })?;
                         let call = ToolCall {
                             function: ToolCallFunction {
+                                id,
                                 name: tool_name.to_string(),
                                 parameters: parameters.to_json(),
                             },
@@ -246,6 +254,46 @@ impl MessageHistory {
         };
         hist.set_max_size(max_size);
         hist
+    }
+
+    pub fn from_value(value: AgentValue) -> Result<Self, AgentError> {
+        let mut messages = vec![];
+
+        if value.is_array() {
+            let Some(arr) = value.as_array() else {
+                return Ok(MessageHistory::new(messages, 0));
+            };
+            for v in arr {
+                let msg: Message = v.clone().try_into()?;
+                messages.push(msg);
+            }
+            return Ok(MessageHistory::new(messages, 0));
+        }
+
+        if let Ok(msg) = value.clone().try_into() {
+            messages.push(msg);
+            return Ok(MessageHistory::new(messages, 0));
+        }
+
+        if value.is_object() {
+            if let Some(arr) = value.get_array("history") {
+                for v in arr {
+                    let msg: Message = v.clone().try_into()?;
+                    messages.push(msg);
+                }
+            }
+            if let Some(msg) = value.get("message") {
+                let msg: Message = msg.clone().try_into()?;
+                messages.push(msg);
+            }
+            if !messages.is_empty() {
+                return Ok(MessageHistory::new(messages, 0));
+            }
+        }
+
+        Err(AgentError::InvalidValue(
+            "Cannot convert AgentValue to MessageHistory".to_string(),
+        ))
     }
 
     /// Create MessageHistory from a JSON value
@@ -372,11 +420,26 @@ impl MessageHistory {
         }
         self.messages.push(message);
     }
+
+    /// Push multiple messages to the history.
+    pub fn push_all(&mut self, messages: Vec<Message>) {
+        for msg in messages {
+            self.push(msg);
+        }
+    }
 }
 
 impl From<MessageHistory> for AgentValue {
     fn from(history: MessageHistory) -> Self {
         AgentValue::array(history.messages.into_iter().map(|m| m.into()).collect())
+    }
+}
+
+impl TryFrom<AgentValue> for MessageHistory {
+    type Error = AgentError;
+
+    fn try_from(value: AgentValue) -> Result<Self, Self::Error> {
+        MessageHistory::from_value(value)
     }
 }
 
@@ -408,6 +471,7 @@ mod tests {
         let mut msg = Message::assistant("".to_string());
         msg.tool_calls = Some(vec![ToolCall {
             function: ToolCallFunction {
+                id: Some("call1".to_string()),
                 name: "get_weather".to_string(),
                 parameters: serde_json::json!({"location": "San Francisco"}),
             },
@@ -501,6 +565,7 @@ mod tests {
             thinking: "".to_string(),
             tool_calls: Some(vec![ToolCall {
                 function: ToolCallFunction {
+                    id: Some("call1".to_string()),
                     name: "active_applications".to_string(),
                     parameters: serde_json::json!({}),
                 },
@@ -563,6 +628,91 @@ mod tests {
         assert_eq!(history.max_size, 0);
         assert_eq!(history.include_system, false);
         assert!(history.system_message.is_none());
+    }
+
+    #[test]
+    fn test_message_history_from_value_array() {
+        let value = AgentValue::array(vec![
+            AgentValue::object(
+                [
+                    ("role".to_string(), AgentValue::string("user")),
+                    ("content".to_string(), AgentValue::string("Hello")),
+                ]
+                .into(),
+            ),
+            AgentValue::object(
+                [
+                    ("role".to_string(), AgentValue::string("assistant")),
+                    ("content".to_string(), AgentValue::string("Hi there!")),
+                ]
+                .into(),
+            ),
+        ]);
+
+        let history = MessageHistory::from_value(value).unwrap();
+        assert_eq!(history.messages.len(), 2);
+        assert_eq!(history.messages[0].role, "user");
+        assert_eq!(history.messages[1].role, "assistant");
+    }
+
+    #[test]
+    fn test_message_history_from_value_single_message_object() {
+        let value = AgentValue::object(
+            [
+                ("role".to_string(), AgentValue::string("user")),
+                ("content".to_string(), AgentValue::string("Solo message")),
+            ]
+            .into(),
+        );
+
+        let history = MessageHistory::from_value(value).unwrap();
+        assert_eq!(history.messages.len(), 1);
+        assert_eq!(history.messages[0].role, "user");
+        assert_eq!(history.messages[0].content, "Solo message");
+    }
+
+    #[test]
+    fn test_message_history_from_value_history_and_message_fields() {
+        let value = AgentValue::object(
+            [
+                (
+                    "history".to_string(),
+                    AgentValue::array(vec![AgentValue::object(
+                        [
+                            ("role".to_string(), AgentValue::string("system")),
+                            (
+                                "content".to_string(),
+                                AgentValue::string("You are a helpful assistant."),
+                            ),
+                        ]
+                        .into(),
+                    )]),
+                ),
+                (
+                    "message".to_string(),
+                    AgentValue::object(
+                        [
+                            ("role".to_string(), AgentValue::string("user")),
+                            ("content".to_string(), AgentValue::string("Hello")),
+                        ]
+                        .into(),
+                    ),
+                ),
+            ]
+            .into(),
+        );
+
+        let history = MessageHistory::from_value(value).unwrap();
+        assert_eq!(history.messages.len(), 2);
+        assert_eq!(history.messages[0].role, "system");
+        assert_eq!(history.messages[1].role, "user");
+        assert_eq!(history.messages[1].content, "Hello");
+    }
+
+    #[test]
+    fn test_message_history_from_value_invalid() {
+        let result = MessageHistory::from_value(AgentValue::integer(42));
+        assert!(result.is_err());
     }
 
     #[test]

@@ -11,6 +11,20 @@ use agent_stream_kit::{
 use regex::Regex;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
+use crate::message::{Message, ToolCall};
+
+const CATEGORY: &str = "LLM/Tool";
+
+const PIN_REGEX: &str = "regex";
+const PIN_TOOLS: &str = "tools";
+
+const PIN_TOOL_IN: &str = "tool_in";
+const PIN_TOOL_OUT: &str = "tool_out";
+
+const CONFIG_TOOL_NAME: &str = "name";
+const CONFIG_TOOL_DESCRIPTION: &str = "description";
+const CONFIG_TOOL_PARAMETERS: &str = "parameters";
+
 #[derive(Clone, Debug)]
 pub struct ToolInfo {
     pub name: String,
@@ -215,19 +229,31 @@ pub async fn call_tool(
     tool_guard.call(ctx, args).await
 }
 
+pub async fn call_tools(
+    ctx: &AgentContext,
+    tool_calls: &Vec<ToolCall>,
+) -> Result<Vec<Message>, AgentError> {
+    if tool_calls.is_empty() {
+        return Ok(vec![]);
+    };
+    let mut resp_messages = vec![];
+
+    for call in tool_calls {
+        let args: AgentValue =
+            AgentValue::from_json(call.function.parameters.clone()).map_err(|e| {
+                AgentError::InvalidValue(format!("Failed to parse tool call parameters: {}", e))
+            })?;
+        let tool_resp = call_tool(ctx.clone(), call.function.name.as_str(), args).await?;
+        resp_messages.push(Message::tool(
+            call.function.name.clone(),
+            tool_resp.to_json().to_string(),
+        ));
+    }
+
+    Ok(resp_messages)
+}
+
 // Agents
-
-const CATEGORY: &str = "LLM/Tool";
-
-const PIN_REGEX: &str = "regex";
-const PIN_TOOLS: &str = "tools";
-
-const PIN_TOOL_IN: &str = "tool_in";
-const PIN_TOOL_OUT: &str = "tool_out";
-
-const CONFIG_TOOL_NAME: &str = "name";
-const CONFIG_TOOL_DESCRIPTION: &str = "description";
-const CONFIG_TOOL_PARAMETERS: &str = "parameters";
 
 #[askit_agent(
     title="List Tools",

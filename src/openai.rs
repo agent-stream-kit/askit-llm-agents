@@ -8,6 +8,10 @@ use agent_stream_kit::{
     AsAgent, async_trait,
 };
 use askit_macros::askit_agent;
+use async_openai::types::{
+    ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk, ChatCompletionTool,
+    ChatCompletionToolArgs, FunctionObjectArgs,
+};
 use async_openai::{
     Client,
     config::OpenAIConfig,
@@ -22,19 +26,23 @@ use async_openai::{
 };
 use futures::StreamExt;
 
-use crate::message::Message;
+use crate::message::{self, Message, MessageHistory, ToolCall};
+use crate::tool::{self, list_tool_infos, list_tool_infos_regex};
 
-static CATEGORY: &str = "LLM";
+static CATEGORY: &str = "LLM/OpenAI";
 
 static PIN_EMBEDDINGS: &str = "embeddings";
+static PIN_HISTORY: &str = "history";
 static PIN_INPUT: &str = "input";
 static PIN_MESSAGE: &str = "message";
+static PIN_RESET: &str = "reset";
 static PIN_RESPONSE: &str = "response";
 
 static CONFIG_MODEL: &str = "model";
 static CONFIG_OPENAI_API_KEY: &str = "openai_api_key";
 static CONFIG_OPTIONS: &str = "options";
 static CONFIG_STREAM: &str = "stream";
+static CONFIG_TOOLS: &str = "tools";
 
 const DEFAULT_CONFIG_MODEL: &str = "gpt-5-nano";
 
@@ -190,15 +198,29 @@ impl AsAgent for OpenAICompletionAgent {
 #[askit_agent(
     title="OpenAI Chat",
     category=CATEGORY,
-    inputs=[PIN_MESSAGE],
-    outputs=[PIN_MESSAGE, PIN_RESPONSE],
+    inputs=[PIN_MESSAGE, PIN_RESET],
+    outputs=[PIN_MESSAGE, PIN_HISTORY, PIN_RESPONSE],
     string_config(name=CONFIG_MODEL, default=DEFAULT_CONFIG_MODEL),
     boolean_config(name=CONFIG_STREAM, title="Stream"),
+    string_config(name=CONFIG_TOOLS, default=""),
     text_config(name=CONFIG_OPTIONS, default="{}")
 )]
 pub struct OpenAIChatAgent {
     data: AgentData,
     manager: OpenAIManager,
+    history: MessageHistory,
+}
+
+impl OpenAIChatAgent {
+    async fn call_tools(
+        &mut self,
+        ctx: AgentContext,
+        tool_calls: &Vec<ToolCall>,
+    ) -> Result<(), AgentError> {
+        let resp_messages = tool::call_tools(&ctx, tool_calls).await?;
+        self.history.push_all(resp_messages);
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -212,137 +234,197 @@ impl AsAgent for OpenAIChatAgent {
         Ok(Self {
             data: AgentData::new(askit, id, def_name, config),
             manager: OpenAIManager::new(),
+            history: MessageHistory::default(),
         })
     }
 
     async fn process(
         &mut self,
         ctx: AgentContext,
-        _pin: String,
+        pin: String,
         value: AgentValue,
     ) -> Result<(), AgentError> {
+        if pin == PIN_RESET {
+            self.history = MessageHistory::default();
+            self.try_output(ctx, PIN_HISTORY, self.history.clone().into())?;
+            return Ok(());
+        }
+
         let config_model = &self.configs()?.get_string_or_default(CONFIG_MODEL);
         if config_model.is_empty() {
             return Ok(());
         }
 
-        let mut messages: Vec<Message> = Vec::new();
-
-        if value.is_string() {
-            let message = value.as_str().unwrap_or("");
-            if message.is_empty() {
-                return Ok(());
-            }
-            messages.push(Message::user(message.to_string()));
-        } else if value.is_object() {
-            let obj = value.as_object().unwrap();
-            if obj.contains_key("role") && obj.contains_key("content") {
-                let msg: Message = value.clone().try_into()?;
-                messages.push(msg);
-            } else {
-                if obj.contains_key("history") {
-                    let history_data = obj.get("history").unwrap();
-                    if history_data.is_array() {
-                        let arr = history_data.as_array().unwrap();
-                        for item in arr {
-                            let msg: Message = item.clone().try_into()?;
-                            messages.push(msg);
-                        }
-                    }
-                }
-                if obj.contains_key("message") {
-                    let msg_data = obj.get("message").unwrap();
-                    let msg: Message = msg_data.clone().try_into()?;
-                    messages.push(msg);
-                }
-            }
-        }
-
+        let messages = MessageHistory::from_value(value)?.messages();
         if messages.is_empty() {
             return Ok(());
         }
 
-        let messages = messages
-            .into_iter()
-            .map(|m| m.into())
-            .collect::<Vec<ChatCompletionRequestMessage>>();
+        for message in messages {
+            self.try_output(ctx.clone(), PIN_MESSAGE, message.clone().into())?;
+            self.history.push(message);
+        }
+        self.try_output(ctx.clone(), PIN_HISTORY, self.history.clone().into())?;
+
+        if self.history.messages().last().unwrap().role != "user" {
+            // If the last message isn’t a user message, just return
+            return Ok(());
+        }
+
+        // let messages = messages
+        //     .into_iter()
+        //     .map(|m| m.into())
+        //     .collect::<Vec<ChatCompletionRequestMessage>>();
+
+        let config_options = self.configs()?.get_string_or_default(CONFIG_OPTIONS);
+        let options_json = if !config_options.is_empty() && config_options != "{}" {
+            Some(
+                serde_json::from_str::<serde_json::Value>(&config_options).map_err(|e| {
+                    AgentError::InvalidValue(format!("Invalid JSON in options: {}", e))
+                })?,
+            )
+        } else {
+            None
+        };
+
+        let config_tools = self.configs()?.get_string_or_default(CONFIG_TOOLS);
+        let tool_infos = if config_tools.is_empty() {
+            list_tool_infos()
+        } else {
+            let regex = regex::Regex::new(&config_tools).map_err(|e| {
+                AgentError::InvalidValue(format!("Invalid regex in tools config: {}", e))
+            })?;
+            list_tool_infos_regex(&regex)
+        }
+        .into_iter()
+        .map(|tool| tool.try_into())
+        .collect::<Result<Vec<ChatCompletionTool>, AgentError>>()?;
 
         let use_stream = self.configs()?.get_bool_or_default(CONFIG_STREAM);
 
-        let mut request = CreateChatCompletionRequestArgs::default()
-            .model(config_model)
-            .messages(messages)
-            .stream(use_stream)
-            .build()
-            .map_err(|e| AgentError::InvalidValue(format!("Failed to build request: {}", e)))?;
-
-        let config_options = self.configs()?.get_string_or_default(CONFIG_OPTIONS);
-        if !config_options.is_empty() && config_options != "{}" {
-            // Merge options into request
-            let options_json = serde_json::from_str::<serde_json::Value>(&config_options)
-                .map_err(|e| AgentError::InvalidValue(format!("Invalid JSON in options: {}", e)))?;
-
-            let mut request_json = serde_json::to_value(&request)
-                .map_err(|e| AgentError::InvalidValue(format!("Serialization error: {}", e)))?;
-
-            if let (Some(request_obj), Some(options_obj)) =
-                (request_json.as_object_mut(), options_json.as_object())
-            {
-                for (key, value) in options_obj {
-                    request_obj.insert(key.clone(), value.clone());
-                }
-            }
-            request = serde_json::from_value::<CreateChatCompletionRequest>(request_json)
-                .map_err(|e| AgentError::InvalidValue(format!("Deserialization error: {}", e)))?;
-        }
-
         let client = self.manager.get_client(self.askit())?;
 
-        if use_stream {
-            let mut stream = client
-                .chat()
-                .create_stream(request)
-                .await
-                .map_err(|e| AgentError::IoError(format!("OpenAI Stream Error: {}", e)))?;
-            let mut content = String::new();
-            while let Some(res) = stream.next().await {
-                let res = res.map_err(|_| AgentError::IoError(format!("OpenAI Stream Error")))?;
-                res.choices.iter().for_each(|c| {
-                    if let Some(ref delta_content) = c.delta.content {
-                        content.push_str(delta_content);
+        loop {
+            let mut request = CreateChatCompletionRequestArgs::default()
+                .model(config_model)
+                .messages(
+                    self.history
+                        .messages_for_prompt()
+                        .iter()
+                        .map(|m| m.clone().into())
+                        .collect::<Vec<ChatCompletionRequestMessage>>(),
+                )
+                .tools(tool_infos.clone())
+                .stream(use_stream)
+                .build()
+                .map_err(|e| AgentError::InvalidValue(format!("Failed to build request: {}", e)))?;
+
+            if let Some(options_json) = &options_json {
+                // Merge options into request
+                let mut request_json = serde_json::to_value(&request)
+                    .map_err(|e| AgentError::InvalidValue(format!("Serialization error: {}", e)))?;
+
+                if let (Some(request_obj), Some(options_obj)) =
+                    (request_json.as_object_mut(), options_json.as_object())
+                {
+                    for (key, value) in options_obj {
+                        request_obj.insert(key.clone(), value.clone());
                     }
-                });
-
-                let mut message = Message::assistant(content.clone());
-                message.id = Some(res.id.clone());
-                self.try_output(ctx.clone(), PIN_MESSAGE, message.into())?;
-
-                let out_response = AgentValue::from_serialize(&res)?;
-                self.try_output(ctx.clone(), PIN_RESPONSE, out_response)?;
-            }
-        } else {
-            let res = client
-                .chat()
-                .create(request)
-                .await
-                .map_err(|e| AgentError::IoError(format!("OpenAI Error: {}", e)))?;
-
-            let mut content = String::new();
-            res.choices.iter().for_each(|c| {
-                if let Some(ref c) = c.message.content {
-                    content.push_str(c);
                 }
-            });
+                request = serde_json::from_value::<CreateChatCompletionRequest>(request_json)
+                    .map_err(|e| {
+                        AgentError::InvalidValue(format!("Deserialization error: {}", e))
+                    })?;
+            }
 
-            let mut res_message = Message::assistant(content);
-            res_message.id = Some(res.id.clone());
-            self.try_output(ctx.clone(), PIN_MESSAGE, res_message.clone().into())?;
+            let id = uuid::Uuid::new_v4().to_string();
+            if use_stream {
+                let mut stream = client
+                    .chat()
+                    .create_stream(request)
+                    .await
+                    .map_err(|e| AgentError::IoError(format!("OpenAI Stream Error: {}", e)))?;
+                let mut message = Message::assistant("".to_string());
+                let mut content = String::new();
+                let mut thinking = String::new();
+                let mut tool_calls: Vec<message::ToolCall> = Vec::new();
+                while let Some(res) = stream.next().await {
+                    let res =
+                        res.map_err(|_| AgentError::IoError(format!("OpenAI Stream Error")))?;
 
-            let out_response = AgentValue::from_serialize(&res)?;
-            self.try_output(ctx.clone(), PIN_RESPONSE, out_response)?;
+                    for c in &res.choices {
+                        if let Some(ref delta_content) = c.delta.content {
+                            content.push_str(delta_content);
+                        }
+                        if let Some(tc) = &c.delta.tool_calls {
+                            for call in tc {
+                                tool_calls.push(call.try_into()?);
+                            }
+                        }
+                        if let Some(refusal) = &c.delta.refusal {
+                            thinking.push_str(&format!("Refusal: {}", refusal));
+                        }
+                    }
+
+                    message.content = content.clone();
+                    message.thinking = thinking.clone();
+                    if !tool_calls.is_empty() {
+                        message.tool_calls = Some(tool_calls.clone());
+                    }
+                    message.id = Some(id.clone());
+
+                    self.history.push(message.clone());
+
+                    self.try_output(ctx.clone(), PIN_MESSAGE, message.clone().into())?;
+
+                    let out_response = AgentValue::from_serialize(&res)?;
+                    self.try_output(ctx.clone(), PIN_RESPONSE, out_response)?;
+
+                    self.try_output(ctx.clone(), PIN_HISTORY, self.history.clone().into())?;
+                }
+
+                // Call tools if any
+                if tool_calls.is_empty() {
+                    return Ok(());
+                }
+                self.call_tools(ctx.clone(), &tool_calls).await?;
+                self.try_output(ctx.clone(), PIN_HISTORY, self.history.clone().into())?;
+            } else {
+                let res = client
+                    .chat()
+                    .create(request)
+                    .await
+                    .map_err(|e| AgentError::IoError(format!("OpenAI Error: {}", e)))?;
+
+                let mut tool_calls: Vec<ToolCall> = Vec::new();
+                for c in &res.choices {
+                    let mut message: Message = c.message.clone().into();
+                    message.id = Some(id.clone());
+
+                    self.history.push(message.clone());
+
+                    self.try_output(ctx.clone(), PIN_MESSAGE, message.clone().into())?;
+
+                    let out_response = AgentValue::from_serialize(&res)?;
+                    self.try_output(ctx.clone(), PIN_RESPONSE, out_response)?;
+
+                    self.try_output(ctx.clone(), PIN_HISTORY, self.history.clone().into())?;
+
+                    if let Some(tc) = &c.message.tool_calls {
+                        for call in tc {
+                            tool_calls.push(call.try_into()?);
+                        }
+                    }
+                }
+
+                // Call tools if any
+                if tool_calls.is_empty() {
+                    return Ok(());
+                }
+                self.call_tools(ctx.clone(), &tool_calls).await?;
+                self.try_output(ctx.clone(), PIN_HISTORY, self.history.clone().into())?;
+            }
         }
-
-        Ok(())
     }
 }
 
@@ -616,7 +698,15 @@ impl From<ChatCompletionResponseMessage> for Message {
             Role::Tool => "tool",
             Role::Function => "function",
         };
-        Message::new(role.to_string(), msg.content.unwrap_or_default())
+        let content = msg.content.unwrap_or_default();
+        let thinking = msg
+            .refusal
+            .map(|r| format!("Refusal: {}", r))
+            .unwrap_or_default();
+
+        let mut msg = Message::new(role.to_string(), content);
+        msg.thinking = thinking;
+        msg
     }
 }
 
@@ -697,5 +787,76 @@ impl From<OutputMessage> for Message {
         let mut message = Message::new(role.to_string(), content);
         message.id = Some(msg.id);
         message
+    }
+}
+
+impl TryFrom<tool::ToolInfo> for ChatCompletionTool {
+    type Error = AgentError;
+
+    fn try_from(info: tool::ToolInfo) -> Result<Self, Self::Error> {
+        let mut function = FunctionObjectArgs::default();
+        function.name(info.name);
+        if !info.description.is_empty() {
+            function.description(info.description);
+        }
+        if let Some(params) = info.parameters {
+            function.parameters(serde_json::to_value(params).map_err(|e| {
+                AgentError::InvalidValue(format!("Failed to serialize tool parameters: {}", e))
+            })?);
+        }
+        Ok(ChatCompletionToolArgs::default()
+            .function(function.build().map_err(|e| {
+                AgentError::InvalidValue(format!("Failed to build tool function: {}", e))
+            })?)
+            .build()
+            .map_err(|e| AgentError::InvalidValue(format!("Failed to build tool: {}", e)))?)
+    }
+}
+
+impl TryFrom<&ChatCompletionMessageToolCallChunk> for message::ToolCall {
+    type Error = AgentError;
+
+    fn try_from(call: &ChatCompletionMessageToolCallChunk) -> Result<Self, AgentError> {
+        let Some(function) = &call.function else {
+            return Err(AgentError::InvalidValue(
+                "ToolCallChunk missing function".to_string(),
+            ));
+        };
+        let Some(name) = &function.name else {
+            return Err(AgentError::InvalidValue(
+                "ToolCallChunk function missing name".to_string(),
+            ));
+        };
+        let parameters = if let Some(arguments) = &function.arguments {
+            serde_json::from_str(arguments).map_err(|e| {
+                AgentError::InvalidValue(format!("Failed to parse tool call arguments JSON: {}", e))
+            })?
+        } else {
+            serde_json::json!({})
+        };
+
+        let function = message::ToolCallFunction {
+            id: call.id.clone(),
+            name: name.clone(),
+            parameters,
+        };
+        Ok(message::ToolCall { function })
+    }
+}
+
+impl TryFrom<&ChatCompletionMessageToolCall> for message::ToolCall {
+    type Error = AgentError;
+
+    fn try_from(call: &ChatCompletionMessageToolCall) -> Result<Self, AgentError> {
+        let parameters = serde_json::from_str(&call.function.arguments).map_err(|e| {
+            AgentError::InvalidValue(format!("Failed to parse tool call arguments JSON: {}", e))
+        })?;
+
+        let function = message::ToolCallFunction {
+            id: Some(call.id.clone()),
+            name: call.function.name.clone(),
+            parameters,
+        };
+        Ok(message::ToolCall { function })
     }
 }
