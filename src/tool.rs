@@ -59,64 +59,6 @@ impl From<ToolInfo> for AgentValue {
     }
 }
 
-struct AgentTool {
-    info: ToolInfo,
-    agent: Arc<AsyncMutex<Box<dyn Agent>>>,
-}
-
-impl AgentTool {
-    fn new(
-        name: String,
-        description: String,
-        parameters: Option<serde_json::Value>,
-        agent: Arc<AsyncMutex<Box<dyn Agent>>>,
-    ) -> Self {
-        Self {
-            info: ToolInfo {
-                name: name,
-                description: description,
-                parameters: parameters,
-            },
-            agent,
-        }
-    }
-
-    async fn tool_call(
-        &self,
-        ctx: AgentContext,
-        args: AgentValue,
-    ) -> Result<AgentValue, AgentError> {
-        // Kick off the tool call while holding the lock, then drop it before awaiting the result
-        let rx = {
-            let mut guard = self.agent.lock().await;
-            let Some(llm_agent) = guard.as_agent_mut::<FlowToolAgent>() else {
-                return Err(AgentError::Other("Agent is not LLMToolAgent".to_string()));
-            };
-            llm_agent.start_tool_call(ctx, args)?
-        };
-
-        tokio::time::timeout(Duration::from_secs(60), rx)
-            .await
-            .map_err(|_| AgentError::Other("tool_call timed out".to_string()))?
-            .map_err(|_| AgentError::Other("tool_out dropped".to_string()))
-    }
-}
-
-#[async_trait]
-impl Tool for AgentTool {
-    fn info(&self) -> &ToolInfo {
-        &self.info
-    }
-
-    async fn call(
-        &mut self,
-        ctx: AgentContext,
-        args: AgentValue,
-    ) -> Result<AgentValue, AgentError> {
-        self.tool_call(ctx, args).await
-    }
-}
-
 #[derive(Clone)]
 struct ToolEntry {
     info: ToolInfo,
@@ -380,6 +322,9 @@ impl AsAgent for FlowToolAgent {
             .get(CONFIG_TOOL_PARAMETERS)
             .ok()
             .and_then(|v| serde_json::to_value(v).ok());
+
+        // TODO: update registered tool info
+
         Ok(())
     }
 
@@ -388,7 +333,7 @@ impl AsAgent for FlowToolAgent {
             .askit()
             .get_agent(self.id())
             .ok_or_else(|| AgentError::AgentNotFound(self.id().to_string()))?;
-        let tool = AgentTool::new(
+        let tool = FlowTool::new(
             self.name.clone(),
             self.description.clone(),
             self.parameters.clone(),
@@ -414,5 +359,63 @@ impl AsAgent for FlowToolAgent {
             let _ = tx.send(value);
         }
         Ok(())
+    }
+}
+
+struct FlowTool {
+    info: ToolInfo,
+    agent: Arc<AsyncMutex<Box<dyn Agent>>>,
+}
+
+impl FlowTool {
+    fn new(
+        name: String,
+        description: String,
+        parameters: Option<serde_json::Value>,
+        agent: Arc<AsyncMutex<Box<dyn Agent>>>,
+    ) -> Self {
+        Self {
+            info: ToolInfo {
+                name: name,
+                description: description,
+                parameters: parameters,
+            },
+            agent,
+        }
+    }
+
+    async fn tool_call(
+        &self,
+        ctx: AgentContext,
+        args: AgentValue,
+    ) -> Result<AgentValue, AgentError> {
+        // Kick off the tool call while holding the lock, then drop it before awaiting the result
+        let rx = {
+            let mut guard = self.agent.lock().await;
+            let Some(flow_agent) = guard.as_agent_mut::<FlowToolAgent>() else {
+                return Err(AgentError::Other("Agent is not FlowToolAgent".to_string()));
+            };
+            flow_agent.start_tool_call(ctx, args)?
+        };
+
+        tokio::time::timeout(Duration::from_secs(60), rx)
+            .await
+            .map_err(|_| AgentError::Other("tool_call timed out".to_string()))?
+            .map_err(|_| AgentError::Other("tool_out dropped".to_string()))
+    }
+}
+
+#[async_trait]
+impl Tool for FlowTool {
+    fn info(&self) -> &ToolInfo {
+        &self.info
+    }
+
+    async fn call(
+        &mut self,
+        ctx: AgentContext,
+        args: AgentValue,
+    ) -> Result<AgentValue, AgentError> {
+        self.tool_call(ctx, args).await
     }
 }

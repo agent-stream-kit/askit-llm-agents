@@ -315,11 +315,20 @@ impl AsAgent for OllamaChatAgent {
                         thinking.push_str(thinking_str);
                     }
                     for call in &res.message.tool_calls {
+                        let mut parameters = call.function.arguments.clone();
+                        if parameters.is_object() {
+                            if let Some(obj) = parameters.as_object() {
+                                if let Some(props) = obj.get("properties") {
+                                    parameters = props.clone();
+                                }
+                            }
+                        }
+
                         let tool_call = crate::message::ToolCall {
                             function: crate::message::ToolCallFunction {
                                 id: None,
                                 name: call.function.name.clone(),
-                                parameters: call.function.arguments.clone(),
+                                parameters,
                             },
                         };
                         tool_calls.push(tool_call);

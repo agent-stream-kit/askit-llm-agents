@@ -26,7 +26,6 @@ use async_openai::{
     },
 };
 use futures::StreamExt;
-use rmcp::model::Tool;
 
 use crate::message::{self, Message, MessageHistory, ToolCall, ToolCallFunction};
 use crate::tool::{self, list_tool_infos, list_tool_infos_regex};
