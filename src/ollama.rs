@@ -512,8 +512,11 @@ impl AsAgent for OllamaEmbeddingsAgent {
                     "Expected exactly one embedding for single string input".to_string(),
                 ));
             }
-            let embedding_value = AgentValue::from_serialize(&embeddings[0])?;
-            return self.try_output(ctx.clone(), PIN_EMBEDDING, embedding_value);
+            return self.try_output(
+                ctx.clone(),
+                PIN_EMBEDDING,
+                AgentValue::tensor(embeddings.into_iter().next().unwrap()),
+            );
         }
 
         if pin == PIN_DOC {
@@ -573,15 +576,14 @@ impl AsAgent for OllamaEmbeddingsAgent {
                 let embeddings = self
                     .generate_embeddings(inputs.into(), config_model.to_string(), model_options)
                     .await?;
-                let embedding_values = embeddings
-                    .iter()
-                    .map(|emb| AgentValue::from_serialize(emb))
-                    .collect::<Result<Vector<_>, _>>()?;
                 let embedding_values_with_offsets: Vector<AgentValue> = offsets
                     .into_iter()
-                    .zip(embedding_values)
+                    .zip(embeddings)
                     .map(|(offset, emb)| {
-                        AgentValue::array(vector![AgentValue::integer(offset), emb])
+                        AgentValue::array(vector![
+                            AgentValue::integer(offset),
+                            AgentValue::tensor(emb)
+                        ])
                     })
                     .collect();
 
@@ -605,14 +607,15 @@ impl AsAgent for OllamaEmbeddingsAgent {
                 return self.try_output(ctx.clone(), PIN_DOC, value);
             }
             let offsets = vec![0i64];
-            let embedding_values = embeddings
-                .iter()
-                .map(|emb| AgentValue::from_serialize(emb))
-                .collect::<Result<Vec<_>, _>>()?;
             let embedding_values_with_offsets: Vector<AgentValue> = offsets
                 .into_iter()
-                .zip(embedding_values)
-                .map(|(offset, emb)| AgentValue::array(vector![AgentValue::integer(offset), emb]))
+                .zip(embeddings)
+                .map(|(offset, emb)| {
+                    AgentValue::array(vector![
+                        AgentValue::integer(offset),
+                        AgentValue::tensor(emb)
+                    ])
+                })
                 .collect();
             let mut output = value.clone();
             output.set(
