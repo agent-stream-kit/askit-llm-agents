@@ -8,6 +8,7 @@ use agent_stream_kit::{
     AgentValue, AsAgent, askit_agent, async_trait,
 };
 
+use im::{Vector, vector};
 use ollama_rs::generation::completion::GenerationContext;
 use ollama_rs::generation::embeddings::request::EmbeddingsInput;
 use ollama_rs::{
@@ -575,11 +576,13 @@ impl AsAgent for OllamaEmbeddingsAgent {
                 let embedding_values = embeddings
                     .iter()
                     .map(|emb| AgentValue::from_serialize(emb))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let embedding_values_with_offsets: Vec<AgentValue> = offsets
+                    .collect::<Result<Vector<_>, _>>()?;
+                let embedding_values_with_offsets: Vector<AgentValue> = offsets
                     .into_iter()
                     .zip(embedding_values)
-                    .map(|(offset, emb)| AgentValue::array(vec![AgentValue::integer(offset), emb]))
+                    .map(|(offset, emb)| {
+                        AgentValue::array(vector![AgentValue::integer(offset), emb])
+                    })
                     .collect();
 
                 let mut output = value.clone();
@@ -606,10 +609,10 @@ impl AsAgent for OllamaEmbeddingsAgent {
                 .iter()
                 .map(|emb| AgentValue::from_serialize(emb))
                 .collect::<Result<Vec<_>, _>>()?;
-            let embedding_values_with_offsets: Vec<AgentValue> = offsets
+            let embedding_values_with_offsets: Vector<AgentValue> = offsets
                 .into_iter()
                 .zip(embedding_values)
-                .map(|(offset, emb)| AgentValue::array(vec![AgentValue::integer(offset), emb]))
+                .map(|(offset, emb)| AgentValue::array(vector![AgentValue::integer(offset), emb]))
                 .collect();
             let mut output = value.clone();
             output.set(
